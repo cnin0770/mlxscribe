@@ -51,6 +51,36 @@ uv run mlxscribe transcribe ./movie.mp4 \
   --keep-audio ./work
 ```
 
+Apply conservative noise filtering:
+
+```bash
+uv run mlxscribe transcribe ./movie.mp4 \
+  --output ./out \
+  --filter-noise
+```
+
+The filter is opt-in. It removes empty or near-instant segments, low-confidence silence, and short repetitive leading hallucinations.
+
+Previous-text context defaults to auto:
+
+```text
+<= 15 minutes: context on
+> 15 minutes: context off
+```
+
+Override it when needed:
+
+```bash
+uv run mlxscribe transcribe ./movie.mp4 --output ./out --context on
+uv run mlxscribe transcribe ./movie.mp4 --output ./out --context off
+```
+
+Filter an existing transcript without re-running transcription:
+
+```bash
+uv run mlxscribe filter ./out/movie.json --output ./out-filtered
+```
+
 The benchmark file includes phase timings for probing, audio extraction, transcription, export, and total runtime.
 
 ## Benchmarks

@@ -16,6 +16,7 @@ from mlxscribe.engine import transcribe_audio
 from mlxscribe.exporters.json_exporter import write_json
 from mlxscribe.exporters.srt import write_srt
 from mlxscribe.exporters.txt import write_txt
+from mlxscribe.filters import FilterOptions, filter_transcript
 from mlxscribe.formats import parse_formats
 from mlxscribe.media import extract_audio, probe_duration
 from mlxscribe.transcripts import clean_segments, load_transcript, transcript_stem
@@ -31,6 +32,8 @@ from mlxscribe.translation import (
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_FORMATS = ("srt", "json", "txt")
 AUTO_LANGUAGE = "auto"
+CONTEXT_AUTO = "auto"
+LONG_FORM_THRESHOLD_SECONDS = 15 * 60
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HF_HOME = PROJECT_ROOT / ".hf-cache"
 
@@ -48,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_summary(args)
         if args.command == "translate":
             return run_translate(args)
+        if args.command == "filter":
+            return run_filter(args)
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
@@ -127,10 +132,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Decode temperature. Defaults to 0.0 for predictable, fast decoding.",
     )
     transcribe_parser.add_argument(
+        "--context",
+        choices=(CONTEXT_AUTO, "on", "off"),
+        default=CONTEXT_AUTO,
+        help="Previous-text context mode. Auto disables context above 15 minutes.",
+    )
+    transcribe_parser.add_argument(
         "--condition-on-previous-text",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use prior transcript text as context for later windows.",
+        dest="condition_on_previous_text_override",
+        action="store_true",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    transcribe_parser.add_argument(
+        "--no-condition-on-previous-text",
+        dest="condition_on_previous_text_override",
+        action="store_false",
+        help=argparse.SUPPRESS,
     )
     transcribe_parser.add_argument(
         "--verbose-engine",
@@ -144,7 +162,42 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="Keep the extracted 16 kHz mono WAV in this directory.",
     )
+    transcribe_parser.add_argument(
+        "--filter-noise",
+        action="store_true",
+        help="Apply conservative transcript noise filtering before writing outputs.",
+    )
+    transcribe_parser.add_argument(
+        "--filter-mode",
+        choices=("conservative",),
+        default="conservative",
+        help="Noise filtering mode.",
+    )
     transcribe_parser.set_defaults(command="transcribe")
+
+    filter_parser = subparsers.add_parser(
+        "filter",
+        help="Apply conservative noise filtering to an existing transcript JSON.",
+    )
+    filter_parser.add_argument("input", type=Path, help="Transcript JSON from mlxscribe.")
+    filter_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Directory where filtered files will be written.",
+    )
+    filter_parser.add_argument(
+        "--formats",
+        default=",".join(DEFAULT_FORMATS),
+        help="Comma-separated output formats: srt,json,txt.",
+    )
+    filter_parser.add_argument(
+        "--filter-mode",
+        choices=("conservative",),
+        default="conservative",
+        help="Noise filtering mode.",
+    )
+    filter_parser.set_defaults(command="filter")
 
     translate_parser = subparsers.add_parser(
         "translate",
@@ -248,6 +301,17 @@ def run_transcribe(args: argparse.Namespace) -> int:
         print(f"Duration: {source_duration:.2f}s")
     print(f"Model: {args.model}")
     print(f"Language: {args.language}")
+    context_decision = resolve_context_mode(
+        requested_mode=args.context,
+        duration_seconds=source_duration,
+        explicit_override=args.condition_on_previous_text_override,
+    )
+    args.condition_on_previous_text = context_decision["enabled"]
+    print(
+        "Context: "
+        f"{'on' if context_decision['enabled'] else 'off'} "
+        f"({context_decision['reason']})"
+    )
     print(f"HF_HOME: {get_hf_home()}")
     print("Extracting audio...")
 
@@ -270,6 +334,13 @@ def run_transcribe(args: argparse.Namespace) -> int:
             phase_timings["extract_audio_seconds"] = time.perf_counter() - phase_started_at
             result = run_engine(args, audio_path)
             phase_timings["transcribe_seconds"] = result.pop("_elapsed_seconds")
+
+    filter_summary = None
+    if args.filter_noise:
+        result, filter_summary = filter_transcript(
+            result,
+            FilterOptions(enabled=True, mode=args.filter_mode),
+        )
 
     output_language = result.get("language") or args.language
     phase_started_at = time.perf_counter()
@@ -294,12 +365,22 @@ def run_transcribe(args: argparse.Namespace) -> int:
         "word_timestamps": args.word_timestamps,
         "temperature": args.temperature,
         "condition_on_previous_text": args.condition_on_previous_text,
+        "condition_on_previous_text_requested": context_decision["requested"],
+        "condition_on_previous_text_reason": context_decision["reason"],
+        "long_form_threshold_seconds": LONG_FORM_THRESHOLD_SECONDS,
         "hf_home": str(get_hf_home()),
         "kept_audio": str(kept_audio_path) if kept_audio_path else None,
         "source_duration_seconds": source_duration,
         "elapsed_seconds": elapsed,
         "realtime_factor": (source_duration / elapsed) if source_duration else None,
         "phase_timings": phase_timings,
+        "filter": filter_summary or {
+            "enabled": False,
+            "mode": args.filter_mode,
+            "dropped_segments": 0,
+            "dropped": [],
+            "rules": [],
+        },
     }
     benchmark_path = output_dir / f"{stem}.benchmark.json"
     benchmark_path.write_text(json.dumps(benchmark, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -310,6 +391,12 @@ def run_transcribe(args: argparse.Namespace) -> int:
     else:
         print(f"Elapsed: {elapsed:.2f}s")
     print_phase_timings(phase_timings)
+    if filter_summary is not None:
+        print(
+            "Filter: "
+            f"dropped {filter_summary['dropped_segments']} segment(s), "
+            f"kept {filter_summary['kept_segments']}"
+        )
     return 0
 
 
@@ -402,6 +489,39 @@ def run_translate(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_filter(args: argparse.Namespace) -> int:
+    input_path = args.input.expanduser().resolve()
+    output_dir = args.output.expanduser().resolve()
+    formats = parse_formats(args.formats)
+    source = load_transcript(input_path)
+    source_language = source.get("language") or "unknown"
+    stem = transcript_stem(input_path, source_language)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    filtered, summary = filter_transcript(
+        source,
+        FilterOptions(enabled=True, mode=args.filter_mode),
+    )
+    write_outputs(
+        result=filtered,
+        output_dir=output_dir,
+        stem=stem,
+        language=source_language,
+        formats=formats,
+    )
+
+    print(f"Input: {input_path}")
+    print(f"Wrote filtered outputs to {output_dir}")
+    print(
+        "Filter: "
+        f"dropped {summary['dropped_segments']} segment(s), "
+        f"kept {summary['kept_segments']}"
+    )
+    if summary["rules"]:
+        print(f"Rules: {', '.join(summary['rules'])}")
+    return 0
+
+
 def run_engine(args: argparse.Namespace, audio_path: Path) -> dict:
     print("Transcribing...")
     started_at = time.perf_counter()
@@ -425,6 +545,48 @@ def normalize_language(language: str) -> str | None:
     if normalized.lower() == AUTO_LANGUAGE:
         return None
     return normalized
+
+
+def resolve_context_mode(
+    *,
+    requested_mode: str,
+    duration_seconds: float | None,
+    explicit_override: bool | None = None,
+) -> dict[str, object]:
+    if explicit_override is not None:
+        return {
+            "enabled": explicit_override,
+            "requested": "on" if explicit_override else "off",
+            "reason": "explicit legacy override",
+        }
+
+    if requested_mode == "on":
+        return {
+            "enabled": True,
+            "requested": requested_mode,
+            "reason": "explicit context mode",
+        }
+    if requested_mode == "off":
+        return {
+            "enabled": False,
+            "requested": requested_mode,
+            "reason": "explicit context mode",
+        }
+    if requested_mode != CONTEXT_AUTO:
+        raise ValueError(f"unsupported context mode: {requested_mode}")
+
+    if duration_seconds is not None and duration_seconds > LONG_FORM_THRESHOLD_SECONDS:
+        return {
+            "enabled": False,
+            "requested": requested_mode,
+            "reason": f"source duration exceeded {LONG_FORM_THRESHOLD_SECONDS}s",
+        }
+
+    return {
+        "enabled": True,
+        "requested": requested_mode,
+        "reason": f"source duration did not exceed {LONG_FORM_THRESHOLD_SECONDS}s",
+    }
 
 
 def print_phase_timings(phase_timings: dict[str, float]) -> None:
