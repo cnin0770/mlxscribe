@@ -13,7 +13,7 @@
 ```bash
 uv sync
 uv run mlxscribe check
-uv run mlxscribe transcribe ./movie.mp4 --language ja --output ./out
+uv run mlxscribe transcribe ./movie.mp4 --output ./out
 ```
 
 The default model is `mlx-community/whisper-large-v3-turbo`.
@@ -30,22 +30,55 @@ Set `HF_HOME` before running the CLI if you want to use a different Hugging Face
 
 ```bash
 uv run mlxscribe transcribe ./movie.mp4 \
-  --language ja \
   --model mlx-community/whisper-large-v3-turbo \
   --output ./out \
   --formats srt,json,txt
+```
+
+Override the source language when you know it:
+
+```bash
+uv run mlxscribe transcribe ./movie.mp4 \
+  --language ja \
+  --output ./out
 ```
 
 Keep extracted audio for debugging or repeat tests:
 
 ```bash
 uv run mlxscribe transcribe ./movie.mp4 \
-  --language ja \
   --output ./out \
   --keep-audio ./work
 ```
 
 The benchmark file includes phase timings for probing, audio extraction, transcription, export, and total runtime.
+
+## Benchmarks
+
+```bash
+uv run mlxscribe summary out/*.benchmark.json
+```
+
+## Translation
+
+Estimate token use without making an API call:
+
+```bash
+uv run mlxscribe translate ./out/movie.json --to en --output ./out
+uv run mlxscribe translate ./out/movie.json --to zh-Hans --output ./out
+```
+
+Run OpenAI translation:
+
+```bash
+export OPENAI_API_KEY=...
+uv run mlxscribe translate ./out/movie.json \
+  --to en \
+  --output ./out \
+  --engine openai
+```
+
+Translation preserves segment timestamps and writes translated JSON, SRT, and TXT files.
 
 Outputs:
 

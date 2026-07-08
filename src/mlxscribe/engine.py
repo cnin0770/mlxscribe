@@ -7,7 +7,7 @@ def transcribe_audio(
     audio_path: Path,
     *,
     model: str,
-    language: str,
+    language: str | None,
     task: str,
     word_timestamps: bool,
     temperature: float,
