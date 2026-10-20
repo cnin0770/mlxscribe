@@ -603,6 +603,8 @@ def run_filter(args: argparse.Namespace) -> int:
     source = load_transcript(input_path)
     source_language = source.get("language") or "unknown"
     stem = transcript_stem(input_path, source_language)
+    if "json" in formats and output_dir / f"{stem}.{source_language}.json" == input_path:
+        raise ValueError(f"filter would overwrite its input {input_path}; choose another --output")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     filtered, summary = filter_transcript(
@@ -841,13 +843,13 @@ def write_outputs(
     language: str,
     formats: tuple[str, ...],
 ) -> None:
-    base = output_dir / f"{stem}.{language}"
+    base = f"{stem}.{language}"
     if "json" in formats:
-        write_json(base.with_suffix(".json"), result)
+        write_json(output_dir / f"{base}.json", result)
     if "txt" in formats:
-        write_txt(base.with_suffix(".txt"), result)
+        write_txt(output_dir / f"{base}.txt", result)
     if "srt" in formats:
-        write_srt(base.with_suffix(".srt"), result)
+        write_srt(output_dir / f"{base}.srt", result)
 
 
 if __name__ == "__main__":

@@ -113,7 +113,7 @@ The benchmark JSON's `chunking` section counts `flagged_chunks` and `retried_chu
 Filter an existing transcript without re-running transcription:
 
 ```bash
-uv run mlxscribe filter ./out/movie.json --output ./out-filtered
+uv run mlxscribe filter ./out/movie.ja.json --output ./out-filtered
 ```
 
 The benchmark file includes phase timings for probing, audio extraction, transcription, export, and total runtime.
@@ -129,15 +129,15 @@ uv run mlxscribe summary out/*.benchmark.json
 Estimate token use without making an API call:
 
 ```bash
-uv run mlxscribe translate ./out/movie.json --to en --output ./out
-uv run mlxscribe translate ./out/movie.json --to zh-Hans --output ./out
+uv run mlxscribe translate ./out/movie.ja.json --to en --output ./out
+uv run mlxscribe translate ./out/movie.ja.json --to zh-Hans --output ./out
 ```
 
 Run OpenAI translation:
 
 ```bash
 export OPENAI_API_KEY=...
-uv run mlxscribe translate ./out/movie.json \
+uv run mlxscribe translate ./out/movie.ja.json \
   --to en \
   --output ./out \
   --engine openai
