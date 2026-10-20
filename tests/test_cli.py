@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import pytest
 
 from mlxscribe import cli
@@ -69,16 +70,16 @@ def test_transcribe_with_chunks_merges_results(tmp_path, monkeypatch) -> None:
     output_dir = tmp_path / "out"
     calls = []
 
-    def fake_transcribe_audio(audio_path, **kwargs):
-        calls.append(kwargs["clip_timestamps"])
-        start = float(kwargs["clip_timestamps"].split(",")[0])
+    def fake_transcribe_audio(audio, **kwargs):
+        calls.append(len(audio) / 16000)
         return {
             "language": "ja",
-            "segments": [{"id": 0, "start": start + 1, "end": start + 2, "text": f"at {start:g}"}],
+            "segments": [{"id": 0, "start": 1.0, "end": 2.0, "text": f"chunk {len(calls)}"}],
         }
 
     monkeypatch.setattr(cli, "probe_duration", lambda path: 150.0)
     monkeypatch.setattr(cli, "extract_audio", lambda source, target: None)
+    monkeypatch.setattr(cli, "load_wav", lambda path: np.zeros(150 * 16000, dtype=np.float32))
     monkeypatch.setattr(cli, "transcribe_audio", fake_transcribe_audio)
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
 
@@ -96,7 +97,8 @@ def test_transcribe_with_chunks_merges_results(tmp_path, monkeypatch) -> None:
     )
 
     assert exit_code == 0
-    assert calls == ["0.000,60.000", "60.000,120.000", "120.000,150.000"]
+    # Silent audio: every point ties, so boundaries stay at the planned positions.
+    assert calls == pytest.approx([60.0, 60.0, 30.0], abs=0.1)
 
     benchmark = json.loads((output_dir / "movie.benchmark.json").read_text(encoding="utf-8"))
     assert benchmark["chunking"]["enabled"] is True
@@ -105,4 +107,5 @@ def test_transcribe_with_chunks_merges_results(tmp_path, monkeypatch) -> None:
     assert all("elapsed_seconds" in chunk for chunk in benchmark["chunking"]["chunks"])
 
     transcript = json.loads((output_dir / "movie.json").read_text(encoding="utf-8"))
-    assert [segment["start"] for segment in transcript["segments"]] == [1.0, 61.0, 121.0]
+    starts = [segment["start"] for segment in transcript["segments"]]
+    assert starts == pytest.approx([1.0, 61.0, 121.0], abs=0.1)

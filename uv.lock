@@ -375,6 +375,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "mlx-whisper" },
+    { name = "numpy" },
     { name = "openai" },
 ]
 
@@ -386,6 +387,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mlx-whisper", specifier = ">=0.4.0" },
+    { name = "numpy", specifier = ">=2.4.6" },
     { name = "openai", specifier = ">=2.0.0" },
 ]
 

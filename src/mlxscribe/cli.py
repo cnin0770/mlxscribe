@@ -12,14 +12,21 @@ from pathlib import Path
 
 from mlxscribe import __version__
 from mlxscribe.benchmark import print_benchmark_summary
-from mlxscribe.chunking import Chunk, format_clip_timestamps, merge_chunk_results, plan_chunks
+from mlxscribe.chunking import (
+    Chunk,
+    merge_chunk_results,
+    offset_result,
+    plan_chunks,
+    slice_audio,
+    snap_chunks_to_quiet,
+)
 from mlxscribe.engine import transcribe_audio
 from mlxscribe.exporters.json_exporter import write_json
 from mlxscribe.exporters.srt import write_srt
 from mlxscribe.exporters.txt import write_txt
 from mlxscribe.filters import FilterOptions, filter_transcript
 from mlxscribe.formats import parse_formats
-from mlxscribe.media import extract_audio, probe_duration
+from mlxscribe.media import extract_audio, load_wav, probe_duration
 from mlxscribe.transcripts import clean_segments, load_transcript, transcript_stem
 from mlxscribe.translation import (
     DEFAULT_MAX_SEGMENTS_PER_BATCH,
@@ -574,8 +581,11 @@ def run_engine(args: argparse.Namespace, audio_path: Path) -> dict:
 
 
 def run_chunked_engine(args: argparse.Namespace, audio_path: Path, chunks: list[Chunk]) -> dict:
-    print("Transcribing chunks...")
     started_at = time.perf_counter()
+    audio = load_wav(audio_path)
+    planned_ends = [chunk.end for chunk in chunks]
+    chunks = snap_chunks_to_quiet(chunks, audio)
+    print("Transcribing chunks...")
     language = normalize_language(args.language)
     results = []
     chunk_timings = []
@@ -586,7 +596,7 @@ def run_chunked_engine(args: argparse.Namespace, audio_path: Path, chunks: list[
             f"{format_seconds(chunk.start)}-{format_seconds(chunk.end)}"
         )
         result = transcribe_audio(
-            audio_path,
+            slice_audio(audio, chunk),
             model=args.model,
             language=language,
             task=args.task,
@@ -594,8 +604,8 @@ def run_chunked_engine(args: argparse.Namespace, audio_path: Path, chunks: list[
             temperature=args.temperature,
             condition_on_previous_text=args.condition_on_previous_text,
             verbose=args.verbose_engine,
-            clip_timestamps=format_clip_timestamps(chunk),
         )
+        result = offset_result(result, chunk.start)
         elapsed = time.perf_counter() - chunk_started_at
         results.append(result)
         chunk_timings.append(
@@ -609,8 +619,11 @@ def run_chunked_engine(args: argparse.Namespace, audio_path: Path, chunks: list[
         )
 
     merged = merge_chunk_results(results, chunks)
-    for summary, timing in zip(merged["chunks"], chunk_timings, strict=True):
+    for summary, timing, planned_end in zip(
+        merged["chunks"], chunk_timings, planned_ends, strict=True
+    ):
         summary["elapsed_seconds"] = timing["elapsed_seconds"]
+        summary["planned_end"] = planned_end
     merged["_elapsed_seconds"] = time.perf_counter() - started_at
     return merged
 

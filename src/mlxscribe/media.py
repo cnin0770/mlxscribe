@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import wave
 from pathlib import Path
+
+import numpy as np
 
 
 def require_tool(name: str) -> str:
@@ -57,3 +60,12 @@ def extract_audio(input_path: Path, output_path: Path) -> None:
         capture_output=True,
         text=True,
     )
+
+
+def load_wav(path: Path) -> np.ndarray:
+    """Read a 16-bit PCM wav (as written by extract_audio) into float32 samples."""
+    with wave.open(str(path), "rb") as reader:
+        if reader.getsampwidth() != 2 or reader.getnchannels() != 1:
+            raise ValueError(f"expected 16-bit mono wav: {path}")
+        frames = reader.readframes(reader.getnframes())
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0

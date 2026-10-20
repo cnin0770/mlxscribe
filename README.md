@@ -84,7 +84,7 @@ uv run mlxscribe transcribe ./movie.mp4 \
   --filter-noise
 ```
 
-Chunking uses absolute timestamps and records per-chunk timing in the benchmark JSON. Chunk boundaries are hard cuts, so a sentence spoken across a boundary may be split into two segments.
+Each chunk boundary moves to the quietest point within 15 seconds of its planned position, so chunks split between sentences rather than mid-sentence. Timestamps stay absolute, and the benchmark JSON records each chunk's actual and planned boundaries and its timing.
 
 Filter an existing transcript without re-running transcription:
 
