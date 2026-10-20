@@ -6,8 +6,16 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 
+# Claude Code worktrees and local settings
+.claude/
+
+# Private planning notes; tracked work lives in backlog/
+ROADMAP.md
+
+# Local media, outputs and caches
 out/
 tmp/
 samples/
 work/
 .hf-cache/
+.mlxscribe-work/
