@@ -13,8 +13,13 @@ def transcribe_audio(
     temperature: float,
     condition_on_previous_text: bool,
     verbose: bool,
+    clip_timestamps: str | None = None,
 ) -> dict:
     import mlx_whisper
+
+    kwargs = {}
+    if clip_timestamps is not None:
+        kwargs["clip_timestamps"] = clip_timestamps
 
     return mlx_whisper.transcribe(
         str(audio_path),
@@ -25,4 +30,5 @@ def transcribe_audio(
         temperature=temperature,
         condition_on_previous_text=condition_on_previous_text,
         verbose=verbose,
+        **kwargs,
     )

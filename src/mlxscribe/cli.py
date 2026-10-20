@@ -12,6 +12,7 @@ from pathlib import Path
 
 from mlxscribe import __version__
 from mlxscribe.benchmark import print_benchmark_summary
+from mlxscribe.chunking import Chunk, format_clip_timestamps, merge_chunk_results, plan_chunks
 from mlxscribe.engine import transcribe_audio
 from mlxscribe.exporters.json_exporter import write_json
 from mlxscribe.exporters.srt import write_srt
@@ -173,6 +174,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="conservative",
         help="Noise filtering mode.",
     )
+    transcribe_parser.add_argument(
+        "--chunk-minutes",
+        type=positive_float,
+        default=None,
+        help="Transcribe in sequential chunks of this many minutes.",
+    )
     transcribe_parser.set_defaults(command="transcribe")
 
     filter_parser = subparsers.add_parser(
@@ -244,6 +251,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def positive_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from None
+    if not number > 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {value}")
+    return number
+
+
 def check_environment() -> int:
     tools = {
         "ffmpeg": shutil.which("ffmpeg"),
@@ -301,6 +318,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
         print(f"Duration: {source_duration:.2f}s")
     print(f"Model: {args.model}")
     print(f"Language: {args.language}")
+    chunks = plan_chunks(source_duration, args.chunk_minutes)
     context_decision = resolve_context_mode(
         requested_mode=args.context,
         duration_seconds=source_duration,
@@ -312,6 +330,10 @@ def run_transcribe(args: argparse.Namespace) -> int:
         f"{'on' if context_decision['enabled'] else 'off'} "
         f"({context_decision['reason']})"
     )
+    if chunks:
+        print(f"Chunks: {len(chunks)} x {args.chunk_minutes:g} minute(s)")
+    elif args.chunk_minutes:
+        print("Chunks: disabled (source duration unknown)")
     print(f"HF_HOME: {get_hf_home()}")
     print("Extracting audio...")
 
@@ -324,7 +346,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
         extract_audio(input_path, audio_path)
         phase_timings["extract_audio_seconds"] = time.perf_counter() - phase_started_at
         kept_audio_path = audio_path
-        result = run_engine(args, audio_path)
+        result = run_transcription(args, audio_path, chunks)
         phase_timings["transcribe_seconds"] = result.pop("_elapsed_seconds")
     else:
         with tempfile.TemporaryDirectory(prefix="mlxscribe-") as temp_dir:
@@ -332,7 +354,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
             phase_started_at = time.perf_counter()
             extract_audio(input_path, audio_path)
             phase_timings["extract_audio_seconds"] = time.perf_counter() - phase_started_at
-            result = run_engine(args, audio_path)
+            result = run_transcription(args, audio_path, chunks)
             phase_timings["transcribe_seconds"] = result.pop("_elapsed_seconds")
 
     filter_summary = None
@@ -368,6 +390,11 @@ def run_transcribe(args: argparse.Namespace) -> int:
         "condition_on_previous_text_requested": context_decision["requested"],
         "condition_on_previous_text_reason": context_decision["reason"],
         "long_form_threshold_seconds": LONG_FORM_THRESHOLD_SECONDS,
+        "chunking": {
+            "enabled": bool(chunks),
+            "chunk_minutes": args.chunk_minutes,
+            "chunks": result.get("chunks", []),
+        },
         "hf_home": str(get_hf_home()),
         "kept_audio": str(kept_audio_path) if kept_audio_path else None,
         "source_duration_seconds": source_duration,
@@ -522,6 +549,12 @@ def run_filter(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_transcription(args: argparse.Namespace, audio_path: Path, chunks: list[Chunk]) -> dict:
+    if chunks:
+        return run_chunked_engine(args, audio_path, chunks)
+    return run_engine(args, audio_path)
+
+
 def run_engine(args: argparse.Namespace, audio_path: Path) -> dict:
     print("Transcribing...")
     started_at = time.perf_counter()
@@ -538,6 +571,48 @@ def run_engine(args: argparse.Namespace, audio_path: Path) -> dict:
     )
     result["_elapsed_seconds"] = time.perf_counter() - started_at
     return result
+
+
+def run_chunked_engine(args: argparse.Namespace, audio_path: Path, chunks: list[Chunk]) -> dict:
+    print("Transcribing chunks...")
+    started_at = time.perf_counter()
+    language = normalize_language(args.language)
+    results = []
+    chunk_timings = []
+    for chunk in chunks:
+        chunk_started_at = time.perf_counter()
+        print(
+            f"  chunk {chunk.index + 1}/{len(chunks)}: "
+            f"{format_seconds(chunk.start)}-{format_seconds(chunk.end)}"
+        )
+        result = transcribe_audio(
+            audio_path,
+            model=args.model,
+            language=language,
+            task=args.task,
+            word_timestamps=args.word_timestamps,
+            temperature=args.temperature,
+            condition_on_previous_text=args.condition_on_previous_text,
+            verbose=args.verbose_engine,
+            clip_timestamps=format_clip_timestamps(chunk),
+        )
+        elapsed = time.perf_counter() - chunk_started_at
+        results.append(result)
+        chunk_timings.append(
+            {
+                "index": chunk.index,
+                "start": chunk.start,
+                "end": chunk.end,
+                "elapsed_seconds": elapsed,
+                "segments": len(result.get("segments") or []),
+            }
+        )
+
+    merged = merge_chunk_results(results, chunks)
+    for summary, timing in zip(merged["chunks"], chunk_timings, strict=True):
+        summary["elapsed_seconds"] = timing["elapsed_seconds"]
+    merged["_elapsed_seconds"] = time.perf_counter() - started_at
+    return merged
 
 
 def normalize_language(language: str) -> str | None:
@@ -594,6 +669,12 @@ def print_phase_timings(phase_timings: dict[str, float]) -> None:
     for name, seconds in phase_timings.items():
         label = name.removesuffix("_seconds").replace("_", " ")
         print(f"  {label}: {seconds:.2f}s")
+
+
+def format_seconds(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    remainder = seconds - minutes * 60
+    return f"{minutes:02d}:{remainder:05.2f}"
 
 
 def configure_huggingface_cache() -> Path:

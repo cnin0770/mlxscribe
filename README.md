@@ -75,6 +75,17 @@ uv run mlxscribe transcribe ./movie.mp4 --output ./out --context on
 uv run mlxscribe transcribe ./movie.mp4 --output ./out --context off
 ```
 
+Transcribe long files in chunks:
+
+```bash
+uv run mlxscribe transcribe ./movie.mp4 \
+  --output ./out \
+  --chunk-minutes 10 \
+  --filter-noise
+```
+
+Chunking uses absolute timestamps and records per-chunk timing in the benchmark JSON. Chunk boundaries are hard cuts, so a sentence spoken across a boundary may be split into two segments.
+
 Filter an existing transcript without re-running transcription:
 
 ```bash
