@@ -23,9 +23,12 @@ class Chunk:
 
 @dataclass(frozen=True)
 class QualityOptions:
-    max_repeat_run: int = 3
+    # Tuned on 45- and 120-minute drama samples: short interjections ("ん", "ああ") repeat
+    # 4-6 times in real dialogue, and a lone looping segment rarely improves on a chunk
+    # retry, while retries reliably fixed runs of 8+ and clusters of 5+ repetitive segments.
+    max_repeat_run: int = 7
     high_compression_ratio: float = FilterOptions.high_compression_ratio
-    max_high_compression_segments: int = 0
+    max_high_compression_segments: int = 4
     min_coverage: float = 0.3
     speech_rms: float = 0.01
     min_active_share: float = 0.05
@@ -176,6 +179,7 @@ def assess_chunk(
     metrics = {
         "segments": len(segments),
         "max_repeat_run": max_repeat_run(segments),
+        "repeat_segments": repeat_run_segments(segments, options.max_repeat_run + 1),
         "max_compression_ratio": round(max(ratios), 3) if ratios else None,
         "high_compression_segments": sum(
             is_high_compression(segment, compression_options) for segment in segments
@@ -199,13 +203,14 @@ def assess_chunk(
 
 
 def quality_rank(assessment: dict) -> tuple:
-    """Sort key for attempts: fewer flags, then more coverage, then shorter loops."""
+    """Sort key for attempts: no dropout first, then fewest looping segments, then coverage."""
+    flags = assessment["flags"]
     metrics = assessment["metrics"]
     return (
-        len(assessment["flags"]),
-        metrics["high_compression_segments"],
+        "no_segments" in flags,
+        "low_coverage" in flags,
+        metrics["repeat_segments"] + metrics["high_compression_segments"],
         -metrics["coverage"],
-        metrics["max_repeat_run"],
     )
 
 
@@ -227,6 +232,23 @@ def max_repeat_run(segments: list[dict]) -> int:
         if text:
             longest = max(longest, run)
     return longest
+
+
+def repeat_run_segments(segments: list[dict], min_run: int) -> int:
+    """Count segments that sit in runs of at least min_run identical texts."""
+    total = 0
+    run = 0
+    previous = None
+    for segment in [*segments, {"text": ""}]:
+        text = normalize_duplicate_text(str(segment.get("text", "")))
+        if text and text == previous:
+            run += 1
+            continue
+        if run >= min_run:
+            total += run
+        run = 1 if text else 0
+        previous = text
+    return total
 
 
 def segment_coverage(segments: list[dict], duration: float) -> float:

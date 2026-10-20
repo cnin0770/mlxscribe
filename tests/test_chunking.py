@@ -143,21 +143,40 @@ def test_assess_chunk_passes_clean_speech() -> None:
 
 
 def test_assess_chunk_flags_repeated_text_loop() -> None:
-    segments = [segment(index, index + 1, "ありがとう。") for index in range(6)]
+    segments = [segment(index, index + 1, "ありがとう。") for index in range(8)]
+
+    assessment = assess_chunk({"segments": segments}, tone(8))
+
+    assert "repeated_text" in assessment["flags"]
+    assert assessment["metrics"]["max_repeat_run"] == 8
+    assert assessment["metrics"]["repeat_segments"] == 8
+
+
+def test_assess_chunk_allows_short_interjection_runs() -> None:
+    segments = [segment(index, index + 1, "ん") for index in range(6)]
 
     assessment = assess_chunk({"segments": segments}, tone(6))
 
-    assert "repeated_text" in assessment["flags"]
-    assert assessment["metrics"]["max_repeat_run"] == 6
+    assert assessment["flags"] == []
+    assert assessment["metrics"]["repeat_segments"] == 0
 
 
 def test_assess_chunk_flags_high_compression() -> None:
-    result = {"segments": [segment(0.0, 9.0, "ああああああ", compression_ratio=3.1)]}
+    segments = [
+        segment(index * 2, index * 2 + 2, f"{index}ああああああ", compression_ratio=3.1)
+        for index in range(5)
+    ]
 
-    assessment = assess_chunk(result, tone(10))
+    assessment = assess_chunk({"segments": segments}, tone(10))
 
     assert assessment["flags"] == ["high_compression"]
     assert assessment["metrics"]["max_compression_ratio"] == 3.1
+
+
+def test_assess_chunk_tolerates_a_lone_high_compression_segment() -> None:
+    result = {"segments": [segment(0.0, 9.0, "ああああああ", compression_ratio=3.1)]}
+
+    assert assess_chunk(result, tone(10))["flags"] == []
 
 
 def test_assess_chunk_flags_low_coverage_only_with_audio() -> None:
@@ -172,16 +191,37 @@ def test_assess_chunk_flags_no_segments_only_with_audio() -> None:
     assert assess_chunk({"segments": []}, silence(20))["flags"] == []
 
 
-def test_quality_rank_prefers_fewer_flags_then_coverage() -> None:
-    looping = {"flags": ["repeated_text"], "metrics": metrics(coverage=0.9)}
+def test_quality_rank_prefers_fewer_bad_segments_then_coverage() -> None:
+    looping = {"flags": ["repeated_text"], "metrics": metrics(coverage=0.9, repeats=8)}
     sparse = {"flags": [], "metrics": metrics(coverage=0.4)}
     full = {"flags": [], "metrics": metrics(coverage=0.8)}
 
     assert min([looping, sparse, full], key=quality_rank) is full
 
 
-def metrics(coverage: float) -> dict:
-    return {"coverage": coverage, "high_compression_segments": 0, "max_repeat_run": 1}
+def test_quality_rank_prefers_one_bad_segment_over_a_long_loop() -> None:
+    # Seen on the 120m sample: a retry traded one high-compression segment for an
+    # 11-segment loop and used to win because both attempts carried one flag.
+    one_bad = {"flags": ["high_compression"], "metrics": metrics(coverage=0.76, high=1)}
+    long_loop = {"flags": ["repeated_text"], "metrics": metrics(coverage=0.82, repeats=11)}
+
+    assert min([long_loop, one_bad], key=quality_rank) is one_bad
+
+
+def test_quality_rank_prefers_any_text_over_a_dropout() -> None:
+    dropout = {"flags": ["no_segments"], "metrics": metrics(coverage=0.0)}
+    looping = {"flags": ["repeated_text"], "metrics": metrics(coverage=0.9, repeats=12)}
+
+    assert min([dropout, looping], key=quality_rank) is looping
+
+
+def metrics(coverage: float, repeats: int = 0, high: int = 0) -> dict:
+    return {
+        "coverage": coverage,
+        "high_compression_segments": high,
+        "repeat_segments": repeats,
+        "max_repeat_run": max(repeats, 1),
+    }
 
 
 def test_retry_temperatures_step_up_and_cap() -> None:

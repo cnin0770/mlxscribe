@@ -45,6 +45,9 @@ DEFAULT_FORMATS = ("srt", "json", "txt")
 AUTO_LANGUAGE = "auto"
 CONTEXT_AUTO = "auto"
 LONG_FORM_THRESHOLD_SECONDS = 15 * 60
+CHUNK_AUTO = "auto"
+CHUNK_OFF = "off"
+DEFAULT_CHUNK_MINUTES = 5.0
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HF_HOME = PROJECT_ROOT / ".hf-cache"
 
@@ -138,9 +141,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transcribe_parser.add_argument(
         "--temperature",
-        type=float,
+        type=parse_temperature,
         default=0.0,
-        help="Decode temperature. Defaults to 0.0 for predictable, fast decoding.",
+        help=(
+            "Decode temperature, or a comma-separated fallback list such as 0,0.2,0.4 "
+            "that mlx-whisper steps through when a 30s window looks repetitive. "
+            "Defaults to 0.0."
+        ),
     )
     transcribe_parser.add_argument(
         "--context",
@@ -186,9 +193,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transcribe_parser.add_argument(
         "--chunk-minutes",
-        type=positive_float,
-        default=None,
-        help="Transcribe in sequential chunks of this many minutes.",
+        type=parse_chunk_minutes,
+        default=CHUNK_AUTO,
+        help=(
+            "Transcribe in sequential chunks of this many minutes. 'auto' (default) "
+            f"uses {DEFAULT_CHUNK_MINUTES:g}-minute chunks for inputs longer than "
+            f"{LONG_FORM_THRESHOLD_SECONDS // 60} minutes; 'off' always transcribes "
+            "the whole file at once."
+        ),
     )
     transcribe_parser.add_argument(
         "--chunk-retries",
@@ -280,6 +292,23 @@ def positive_float(value: str) -> float:
     return number
 
 
+def parse_temperature(value: str) -> float | tuple[float, ...]:
+    try:
+        values = tuple(float(part) for part in value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected numbers, got {value!r}") from None
+    if any(not 0 <= number <= 1 for number in values):
+        raise argparse.ArgumentTypeError(f"temperatures must be between 0 and 1, got {value}")
+    return values[0] if len(values) == 1 else values
+
+
+def parse_chunk_minutes(value: str) -> str | float:
+    normalized = value.strip().lower()
+    if normalized in (CHUNK_AUTO, CHUNK_OFF):
+        return normalized
+    return positive_float(value)
+
+
 def non_negative_int(value: str) -> int:
     try:
         number = int(value)
@@ -347,7 +376,11 @@ def run_transcribe(args: argparse.Namespace) -> int:
         print(f"Duration: {source_duration:.2f}s")
     print(f"Model: {args.model}")
     print(f"Language: {args.language}")
-    chunks = plan_chunks(source_duration, args.chunk_minutes)
+    chunk_decision = resolve_chunk_mode(
+        requested=args.chunk_minutes,
+        duration_seconds=source_duration,
+    )
+    chunks = plan_chunks(source_duration, chunk_decision["minutes"])
     context_decision = resolve_context_mode(
         requested_mode=args.context,
         duration_seconds=source_duration,
@@ -360,9 +393,12 @@ def run_transcribe(args: argparse.Namespace) -> int:
         f"({context_decision['reason']})"
     )
     if chunks:
-        print(f"Chunks: {len(chunks)} x {args.chunk_minutes:g} minute(s)")
-    elif args.chunk_minutes:
-        print("Chunks: disabled (source duration unknown)")
+        print(
+            f"Chunks: {len(chunks)} x {chunk_decision['minutes']:g} minute(s) "
+            f"({chunk_decision['reason']})"
+        )
+    else:
+        print(f"Chunks: off ({chunk_decision['reason']})")
     print(f"HF_HOME: {get_hf_home()}")
     print("Extracting audio...")
 
@@ -421,7 +457,9 @@ def run_transcribe(args: argparse.Namespace) -> int:
         "long_form_threshold_seconds": LONG_FORM_THRESHOLD_SECONDS,
         "chunking": {
             "enabled": bool(chunks),
-            "chunk_minutes": args.chunk_minutes,
+            "requested": args.chunk_minutes,
+            "reason": chunk_decision["reason"],
+            "chunk_minutes": chunk_decision["minutes"],
             "chunk_retries": args.chunk_retries,
             "flagged_chunks": sum(
                 chunk["quality"]["flagged"] for chunk in result.get("chunks", [])
@@ -699,6 +737,28 @@ def normalize_language(language: str) -> str | None:
     if normalized.lower() == AUTO_LANGUAGE:
         return None
     return normalized
+
+
+def resolve_chunk_mode(
+    *,
+    requested: str | float,
+    duration_seconds: float | None,
+) -> dict[str, object]:
+    if requested == CHUNK_OFF:
+        return {"minutes": None, "reason": "explicit off"}
+    if duration_seconds is None:
+        return {"minutes": None, "reason": "source duration unknown"}
+    if requested != CHUNK_AUTO:
+        return {"minutes": float(requested), "reason": "explicit chunk length"}
+    if duration_seconds > LONG_FORM_THRESHOLD_SECONDS:
+        return {
+            "minutes": DEFAULT_CHUNK_MINUTES,
+            "reason": f"source duration exceeded {LONG_FORM_THRESHOLD_SECONDS}s",
+        }
+    return {
+        "minutes": None,
+        "reason": f"source duration did not exceed {LONG_FORM_THRESHOLD_SECONDS}s",
+    }
 
 
 def resolve_context_mode(

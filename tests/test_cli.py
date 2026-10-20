@@ -60,8 +60,10 @@ def test_resolve_context_legacy_override_wins() -> None:
 def test_chunk_minutes_rejects_non_positive_values(capsys) -> None:
     for value in ("0", "-5", "abc"):
         with pytest.raises(SystemExit):
-            build_parser().parse_args(["transcribe", "movie.mp4", "--chunk-minutes", value])
-    assert "--chunk-minutes" in capsys.readouterr().err
+            build_parser().parse_args(
+                ["transcribe", "movie.mp4", "--output", "out", "--chunk-minutes", value]
+            )
+        assert "argument --chunk-minutes" in capsys.readouterr().err
 
 
 def test_transcribe_with_chunks_merges_results(tmp_path, monkeypatch) -> None:
@@ -200,3 +202,39 @@ def test_chunk_retries_rejects_negative_values(capsys) -> None:
     with pytest.raises(SystemExit):
         build_parser().parse_args(["transcribe", "movie.mp4", "--chunk-retries", "-1"])
     assert "--chunk-retries" in capsys.readouterr().err
+
+
+def test_resolve_chunk_mode_auto_chunks_only_long_inputs() -> None:
+    long_input = cli.resolve_chunk_mode(
+        requested="auto", duration_seconds=LONG_FORM_THRESHOLD_SECONDS + 1
+    )
+    short_input = cli.resolve_chunk_mode(
+        requested="auto", duration_seconds=LONG_FORM_THRESHOLD_SECONDS
+    )
+
+    assert long_input["minutes"] == cli.DEFAULT_CHUNK_MINUTES
+    assert short_input["minutes"] is None
+
+
+def test_resolve_chunk_mode_explicit_values_override_duration() -> None:
+    assert cli.resolve_chunk_mode(requested="off", duration_seconds=99999)["minutes"] is None
+    assert cli.resolve_chunk_mode(requested=2.0, duration_seconds=60)["minutes"] == 2.0
+    assert cli.resolve_chunk_mode(requested="auto", duration_seconds=None)["minutes"] is None
+
+
+def test_chunk_minutes_accepts_auto_off_and_numbers() -> None:
+    parse = lambda *extra: build_parser().parse_args(["transcribe", "movie.mp4", "--output", "out", *extra])
+
+    assert parse().chunk_minutes == "auto"
+    assert parse("--chunk-minutes", "OFF").chunk_minutes == "off"
+    assert parse("--chunk-minutes", "2.5").chunk_minutes == 2.5
+
+
+def test_temperature_accepts_single_value_or_fallback_list() -> None:
+    parse = lambda *extra: build_parser().parse_args(["transcribe", "movie.mp4", "--output", "out", *extra])
+
+    assert parse().temperature == 0.0
+    assert parse("--temperature", "0.2").temperature == 0.2
+    assert parse("--temperature", "0,0.2,0.4").temperature == (0.0, 0.2, 0.4)
+    with pytest.raises(SystemExit):
+        parse("--temperature", "0,1.5")
