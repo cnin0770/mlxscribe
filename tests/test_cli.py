@@ -10,6 +10,7 @@ from mlxscribe.cli import (
     normalize_language,
     resolve_context_mode,
 )
+from mlxscribe.transcripts import transcript_stem
 
 
 def test_normalize_language_maps_auto_to_none() -> None:
@@ -108,7 +109,7 @@ def test_transcribe_with_chunks_merges_results(tmp_path, monkeypatch) -> None:
     assert [chunk["segments"] for chunk in benchmark["chunking"]["chunks"]] == [1, 1, 1]
     assert all("elapsed_seconds" in chunk for chunk in benchmark["chunking"]["chunks"])
 
-    transcript = json.loads((output_dir / "movie.json").read_text(encoding="utf-8"))
+    transcript = json.loads((output_dir / "movie.ja.json").read_text(encoding="utf-8"))
     starts = [segment["start"] for segment in transcript["segments"]]
     assert starts == pytest.approx([1.0, 61.0, 121.0], abs=0.1)
 
@@ -148,7 +149,7 @@ def run_one_chunk(tmp_path, monkeypatch, responses: list[list[dict]], *extra: st
     )
     assert exit_code == 0
     benchmark = json.loads((output_dir / "movie.benchmark.json").read_text(encoding="utf-8"))
-    transcript = json.loads((output_dir / "movie.json").read_text(encoding="utf-8"))
+    transcript = json.loads((output_dir / "movie.ja.json").read_text(encoding="utf-8"))
     return temperatures, benchmark, transcript
 
 
@@ -238,3 +239,28 @@ def test_temperature_accepts_single_value_or_fallback_list() -> None:
     assert parse("--temperature", "0,0.2,0.4").temperature == (0.0, 0.2, 0.4)
     with pytest.raises(SystemExit):
         parse("--temperature", "0,1.5")
+
+
+def test_filter_keeps_language_in_output_names(tmp_path) -> None:
+    source = tmp_path / "movie.ja.json"
+    source.write_text(
+        json.dumps({"language": "ja", "segments": [{"id": 0, "start": 0.0, "end": 2.0, "text": "こんにちは"}]}),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "filtered"
+
+    assert cli.main(["filter", str(source), "--output", str(output_dir)]) == 0
+    assert sorted(path.name for path in output_dir.iterdir()) == ["movie.ja.json", "movie.ja.srt", "movie.ja.txt"]
+
+
+def test_filter_refuses_to_overwrite_its_input(tmp_path) -> None:
+    source = tmp_path / "movie.ja.json"
+    original = json.dumps({"language": "ja", "segments": []})
+    source.write_text(original, encoding="utf-8")
+
+    assert cli.main(["filter", str(source), "--output", str(tmp_path)]) == 1
+    assert source.read_text(encoding="utf-8") == original
+
+
+def test_transcript_stem_round_trips_output_name(tmp_path) -> None:
+    assert transcript_stem(tmp_path / "movie.ja.json", "ja") == "movie"

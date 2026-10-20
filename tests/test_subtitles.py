@@ -281,18 +281,18 @@ def test_filter_command_cleans_srt_and_txt_but_keeps_raw_json(tmp_path: Path) ->
 
     assert cli.main(["filter", str(source), "--output", str(output)]) == 0
 
-    written = json.loads((output / "movie.json").read_text(encoding="utf-8"))
+    written = json.loads((output / "movie.ja.json").read_text(encoding="utf-8"))
     assert [segment["text"] for segment in written["segments"]] == [
         segment["text"] for segment in raw["segments"]
     ]
     assert written["subtitles"]["merged_segments"] == 1
     assert written["subtitles"]["split_segments"] == 1
 
-    srt = (output / "movie.srt").read_text(encoding="utf-8")
+    srt = (output / "movie.ja.srt").read_text(encoding="utf-8")
     assert "ただいま はい" in srt
     text_lines = [line for line in srt.splitlines() if line and "-->" not in line and not line.isdigit()]
     assert all(len(line) <= 16 for line in text_lines)
-    txt = (output / "movie.txt").read_text(encoding="utf-8")
+    txt = (output / "movie.ja.txt").read_text(encoding="utf-8")
     assert txt.splitlines()[0] == "[00:00:00.000] ただいま はい"
 
 
@@ -304,7 +304,7 @@ def test_filter_command_can_disable_cleanup(tmp_path: Path) -> None:
 
     assert cli.main(["filter", str(source), "--output", str(output), "--no-subtitle-cleanup"]) == 0
 
-    assert (output / "movie.srt").read_text(encoding="utf-8") == "1\n00:00:00,000 --> 00:00:00,200\nHi\n"
+    assert (output / "movie.en.srt").read_text(encoding="utf-8") == "1\n00:00:00,000 --> 00:00:00,200\nHi\n"
 
 
 def test_subtitle_options_come_from_cli_flags() -> None:
@@ -369,6 +369,6 @@ def test_transcribe_records_subtitle_summary_in_benchmark(tmp_path, monkeypatch)
     benchmark = json.loads((output_dir / "movie.benchmark.json").read_text(encoding="utf-8"))
     assert benchmark["subtitles"]["enabled"] is True
     assert benchmark["subtitles"]["merged_segments"] == 1
-    transcript = json.loads((output_dir / "movie.json").read_text(encoding="utf-8"))
+    transcript = json.loads((output_dir / "movie.ja.json").read_text(encoding="utf-8"))
     assert len(transcript["segments"]) == 2
-    assert "ただいま はい" in (output_dir / "movie.srt").read_text(encoding="utf-8")
+    assert "ただいま はい" in (output_dir / "movie.ja.srt").read_text(encoding="utf-8")

@@ -1,6 +1,9 @@
+from pathlib import Path
+
 from mlxscribe.translation import (
     estimate_translation_tokens,
     parse_translation_response,
+    write_translation_outputs,
 )
 
 
@@ -23,3 +26,14 @@ def test_parse_translation_response_accepts_json_array() -> None:
     parsed = parse_translation_response('[{"id": 1, "text": "Hello"}]')
 
     assert parsed == [{"id": 1, "text": "Hello"}]
+
+
+def test_write_translation_outputs_keeps_language_in_names(tmp_path) -> None:
+    result = {"language": "en", "segments": [{"id": 0, "start": 0.0, "end": 1.0, "text": "hello"}]}
+    paths = write_translation_outputs(result=result, output_dir=tmp_path, stem="movie", target_language="en")
+
+    assert {key: Path(value).name for key, value in paths.items()} == {
+        "json": "movie.en.json",
+        "srt": "movie.en.srt",
+        "txt": "movie.en.txt",
+    }
