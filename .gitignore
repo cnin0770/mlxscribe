@@ -9,8 +9,9 @@ __pycache__/
 # Claude Code worktrees and local settings
 .claude/
 
-# Private planning notes; tracked work lives in backlog/
+# Private planning notes
 ROADMAP.md
+backlog/
 
 # Local media, outputs and caches
 out/
