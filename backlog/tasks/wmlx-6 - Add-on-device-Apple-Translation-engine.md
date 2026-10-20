@@ -4,13 +4,12 @@ title: Add on-device Apple Translation engine
 status: In Progress
 assignee: []
 created_date: '2026-10-20 04:01'
-updated_date: '2026-10-20 04:01'
+updated_date: '2026-10-20 04:02'
 labels:
   - translation
 dependencies: []
 references:
   - branch apple-translation
-  - commit 7aa042a
   - src/mlxscribe/apple_translation.py
 ordinal: 6000
 ---
@@ -32,7 +31,7 @@ OpenAI translation costs money per run, which discourages trying things. macOS s
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-Implemented on branch apple-translation (7aa042a). Remaining: user trial on the branch, then fast-forward into main and push.
+Implemented on branch apple-translation (one commit on top of main). Remaining: user trial on the branch, then fast-forward into main and push.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
