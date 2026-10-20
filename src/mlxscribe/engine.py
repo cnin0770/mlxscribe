@@ -12,7 +12,7 @@ def transcribe_audio(
     language: str | None,
     task: str,
     word_timestamps: bool,
-    temperature: float,
+    temperature: float | tuple[float, ...],
     condition_on_previous_text: bool,
     verbose: bool,
 ) -> dict:

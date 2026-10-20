@@ -109,3 +109,94 @@ def test_transcribe_with_chunks_merges_results(tmp_path, monkeypatch) -> None:
     transcript = json.loads((output_dir / "movie.json").read_text(encoding="utf-8"))
     starts = [segment["start"] for segment in transcript["segments"]]
     assert starts == pytest.approx([1.0, 61.0, 121.0], abs=0.1)
+
+
+LOOP = [{"id": index, "start": index, "end": index + 1, "text": "ループ"} for index in range(8)]
+CLEAN = [{"id": 0, "start": 0.0, "end": 50.0, "text": "きれいな文章"}]
+
+
+def run_one_chunk(tmp_path, monkeypatch, responses: list[list[dict]], *extra: str) -> tuple:
+    input_path = tmp_path / "movie.mp4"
+    input_path.write_bytes(b"")
+    output_dir = tmp_path / "out"
+    temperatures = []
+
+    def fake_transcribe_audio(audio, **kwargs):
+        temperatures.append(kwargs["temperature"])
+        return {"language": "ja", "segments": responses[len(temperatures) - 1]}
+
+    monkeypatch.setattr(cli, "probe_duration", lambda path: 60.0)
+    monkeypatch.setattr(cli, "extract_audio", lambda source, target: None)
+    monkeypatch.setattr(cli, "load_wav", lambda path: np.zeros(60 * 16000, dtype=np.float32))
+    monkeypatch.setattr(cli, "transcribe_audio", fake_transcribe_audio)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+
+    exit_code = cli.main(
+        [
+            "transcribe",
+            str(input_path),
+            "--output",
+            str(output_dir),
+            "--formats",
+            "json",
+            "--chunk-minutes",
+            "1",
+            *extra,
+        ]
+    )
+    assert exit_code == 0
+    benchmark = json.loads((output_dir / "movie.benchmark.json").read_text(encoding="utf-8"))
+    transcript = json.loads((output_dir / "movie.json").read_text(encoding="utf-8"))
+    return temperatures, benchmark, transcript
+
+
+def test_chunked_retry_keeps_better_attempt(tmp_path, monkeypatch) -> None:
+    temperatures, benchmark, transcript = run_one_chunk(tmp_path, monkeypatch, [LOOP, CLEAN])
+
+    assert temperatures == [0.0, (0.2, 0.4)]
+    quality = benchmark["chunking"]["chunks"][0]["quality"]
+    assert quality["flagged"] is True
+    assert quality["chosen_attempt"] == 1
+    assert quality["flags"] == []
+    assert [attempt["flags"] for attempt in quality["attempts"]] == [["repeated_text"], []]
+    assert quality["attempts"][1]["temperature"] == [0.2, 0.4]
+    assert benchmark["chunking"]["flagged_chunks"] == 1
+    assert benchmark["chunking"]["retried_chunks"] == 1
+    assert [segment["text"] for segment in transcript["segments"]] == ["きれいな文章"]
+
+
+def test_chunked_retry_keeps_original_when_retry_is_no_better(tmp_path, monkeypatch) -> None:
+    temperatures, benchmark, transcript = run_one_chunk(tmp_path, monkeypatch, [LOOP, LOOP])
+
+    assert len(temperatures) == 2
+    quality = benchmark["chunking"]["chunks"][0]["quality"]
+    assert quality["chosen_attempt"] == 0
+    assert quality["flags"] == ["repeated_text"]
+    assert len(transcript["segments"]) == len(LOOP)
+
+
+def test_chunked_retry_skips_clean_chunks(tmp_path, monkeypatch) -> None:
+    temperatures, benchmark, _ = run_one_chunk(tmp_path, monkeypatch, [CLEAN])
+
+    assert temperatures == [0.0]
+    quality = benchmark["chunking"]["chunks"][0]["quality"]
+    assert quality["flagged"] is False
+    assert len(quality["attempts"]) == 1
+    assert benchmark["chunking"]["retried_chunks"] == 0
+
+
+def test_chunk_retries_zero_disables_retry(tmp_path, monkeypatch) -> None:
+    temperatures, benchmark, _ = run_one_chunk(
+        tmp_path, monkeypatch, [LOOP], "--chunk-retries", "0"
+    )
+
+    assert temperatures == [0.0]
+    assert benchmark["chunking"]["chunk_retries"] == 0
+    assert benchmark["chunking"]["flagged_chunks"] == 1
+    assert benchmark["chunking"]["retried_chunks"] == 0
+
+
+def test_chunk_retries_rejects_negative_values(capsys) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["transcribe", "movie.mp4", "--chunk-retries", "-1"])
+    assert "--chunk-retries" in capsys.readouterr().err

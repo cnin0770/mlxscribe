@@ -14,9 +14,12 @@ from mlxscribe import __version__
 from mlxscribe.benchmark import print_benchmark_summary
 from mlxscribe.chunking import (
     Chunk,
+    assess_chunk,
     merge_chunk_results,
     offset_result,
     plan_chunks,
+    quality_rank,
+    retry_temperatures,
     slice_audio,
     snap_chunks_to_quiet,
 )
@@ -187,6 +190,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Transcribe in sequential chunks of this many minutes.",
     )
+    transcribe_parser.add_argument(
+        "--chunk-retries",
+        type=non_negative_int,
+        default=1,
+        help=(
+            "Retry a chunk flagged as looping or empty this many times with a higher "
+            "temperature. Defaults to 1; 0 disables retries."
+        ),
+    )
     transcribe_parser.set_defaults(command="transcribe")
 
     filter_parser = subparsers.add_parser(
@@ -265,6 +277,16 @@ def positive_float(value: str) -> float:
         raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from None
     if not number > 0:
         raise argparse.ArgumentTypeError(f"must be greater than 0, got {value}")
+    return number
+
+
+def non_negative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or greater, got {value}")
     return number
 
 
@@ -400,6 +422,13 @@ def run_transcribe(args: argparse.Namespace) -> int:
         "chunking": {
             "enabled": bool(chunks),
             "chunk_minutes": args.chunk_minutes,
+            "chunk_retries": args.chunk_retries,
+            "flagged_chunks": sum(
+                chunk["quality"]["flagged"] for chunk in result.get("chunks", [])
+            ),
+            "retried_chunks": sum(
+                len(chunk["quality"]["attempts"]) > 1 for chunk in result.get("chunks", [])
+            ),
             "chunks": result.get("chunks", []),
         },
         "hf_home": str(get_hf_home()),
@@ -425,6 +454,12 @@ def run_transcribe(args: argparse.Namespace) -> int:
     else:
         print(f"Elapsed: {elapsed:.2f}s")
     print_phase_timings(phase_timings)
+    if chunks:
+        print(
+            "Chunk quality: "
+            f"{benchmark['chunking']['flagged_chunks']} flagged, "
+            f"{benchmark['chunking']['retried_chunks']} retried"
+        )
     if filter_summary is not None:
         print(
             "Filter: "
@@ -588,42 +623,73 @@ def run_chunked_engine(args: argparse.Namespace, audio_path: Path, chunks: list[
     print("Transcribing chunks...")
     language = normalize_language(args.language)
     results = []
-    chunk_timings = []
+    chunk_reports = []
     for chunk in chunks:
         chunk_started_at = time.perf_counter()
         print(
             f"  chunk {chunk.index + 1}/{len(chunks)}: "
             f"{format_seconds(chunk.start)}-{format_seconds(chunk.end)}"
         )
-        result = transcribe_audio(
-            slice_audio(audio, chunk),
-            model=args.model,
-            language=language,
-            task=args.task,
-            word_timestamps=args.word_timestamps,
-            temperature=args.temperature,
-            condition_on_previous_text=args.condition_on_previous_text,
-            verbose=args.verbose_engine,
-        )
-        result = offset_result(result, chunk.start)
-        elapsed = time.perf_counter() - chunk_started_at
+        chunk_audio = slice_audio(audio, chunk)
+        attempts = []
+        temperature = args.temperature
+        for retry in range(args.chunk_retries + 1):
+            if retry:
+                temperature = retry_temperatures(retry)
+                print(f"    retrying at temperature {format_temperature(temperature)}")
+            attempt_started_at = time.perf_counter()
+            result = transcribe_audio(
+                chunk_audio,
+                model=args.model,
+                language=language,
+                task=args.task,
+                word_timestamps=args.word_timestamps,
+                temperature=temperature,
+                condition_on_previous_text=args.condition_on_previous_text,
+                verbose=args.verbose_engine,
+            )
+            assessment = assess_chunk(result, chunk_audio)
+            attempts.append(
+                {
+                    "attempt": retry,
+                    "temperature": list(temperature)
+                    if isinstance(temperature, tuple)
+                    else temperature,
+                    "elapsed_seconds": time.perf_counter() - attempt_started_at,
+                    **assessment,
+                    "_result": result,
+                }
+            )
+            if not assessment["flags"]:
+                break
+            print(f"    flagged: {', '.join(assessment['flags'])}")
+
+        chosen = min(attempts, key=quality_rank)
+        if len(attempts) > 1:
+            print(f"    kept attempt {chosen['attempt']}")
+        result = offset_result(chosen["_result"], chunk.start)
+        for attempt in attempts:
+            del attempt["_result"]
         results.append(result)
-        chunk_timings.append(
+        chunk_reports.append(
             {
-                "index": chunk.index,
-                "start": chunk.start,
-                "end": chunk.end,
-                "elapsed_seconds": elapsed,
-                "segments": len(result.get("segments") or []),
+                "elapsed_seconds": time.perf_counter() - chunk_started_at,
+                "quality": {
+                    "flagged": bool(attempts[0]["flags"]),
+                    "flags": chosen["flags"],
+                    "chosen_attempt": chosen["attempt"],
+                    "attempts": attempts,
+                },
             }
         )
 
     merged = merge_chunk_results(results, chunks)
-    for summary, timing, planned_end in zip(
-        merged["chunks"], chunk_timings, planned_ends, strict=True
+    for summary, report, planned_end in zip(
+        merged["chunks"], chunk_reports, planned_ends, strict=True
     ):
-        summary["elapsed_seconds"] = timing["elapsed_seconds"]
+        summary["elapsed_seconds"] = report["elapsed_seconds"]
         summary["planned_end"] = planned_end
+        summary["quality"] = report["quality"]
     merged["_elapsed_seconds"] = time.perf_counter() - started_at
     return merged
 
@@ -682,6 +748,12 @@ def print_phase_timings(phase_timings: dict[str, float]) -> None:
     for name, seconds in phase_timings.items():
         label = name.removesuffix("_seconds").replace("_", " ")
         print(f"  {label}: {seconds:.2f}s")
+
+
+def format_temperature(temperature: float | tuple[float, ...]) -> str:
+    if isinstance(temperature, tuple):
+        return ", ".join(f"{value:g}" for value in temperature)
+    return f"{temperature:g}"
 
 
 def format_seconds(seconds: float) -> str:

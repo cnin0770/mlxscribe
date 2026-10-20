@@ -4,10 +4,14 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from mlxscribe.filters import FilterOptions, is_high_compression, normalize_duplicate_text
+
 SAMPLE_RATE = 16000
 SNAP_WINDOW_SECONDS = 15.0
 ENERGY_FRAME_SECONDS = 0.1
 ENERGY_SMOOTH_FRAMES = 5
+RETRY_TEMPERATURE_STEP = 0.2
+MAX_RETRY_TEMPERATURE = 1.0
 
 
 @dataclass(frozen=True)
@@ -15,6 +19,16 @@ class Chunk:
     index: int
     start: float
     end: float
+
+
+@dataclass(frozen=True)
+class QualityOptions:
+    max_repeat_run: int = 3
+    high_compression_ratio: float = FilterOptions.high_compression_ratio
+    max_high_compression_segments: int = 0
+    min_coverage: float = 0.3
+    speech_rms: float = 0.01
+    min_active_share: float = 0.05
 
 
 def plan_chunks(duration_seconds: float | None, chunk_minutes: float | None) -> list[Chunk]:
@@ -140,3 +154,106 @@ def merge_chunk_results(results: list[dict], chunks: list[Chunk]) -> dict:
         "language": language,
         "chunks": chunk_summaries,
     }
+
+
+def assess_chunk(
+    result: dict,
+    audio: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    options: QualityOptions = QualityOptions(),
+) -> dict:
+    """Flag a chunk-relative result that looks like a decoding loop or a dropout."""
+    segments = result.get("segments") or []
+    duration = len(audio) / sample_rate
+    active_share = active_audio_share(audio, sample_rate, options.speech_rms)
+    has_audio = active_share >= options.min_active_share
+    compression_options = FilterOptions(high_compression_ratio=options.high_compression_ratio)
+    ratios = [
+        float(segment["compression_ratio"])
+        for segment in segments
+        if isinstance(segment.get("compression_ratio"), (int, float))
+    ]
+    metrics = {
+        "segments": len(segments),
+        "max_repeat_run": max_repeat_run(segments),
+        "max_compression_ratio": round(max(ratios), 3) if ratios else None,
+        "high_compression_segments": sum(
+            is_high_compression(segment, compression_options) for segment in segments
+        ),
+        "coverage": round(segment_coverage(segments, duration), 3),
+        "active_share": round(active_share, 3),
+    }
+
+    flags = []
+    if not segments:
+        if has_audio:
+            flags.append("no_segments")
+    else:
+        if metrics["max_repeat_run"] > options.max_repeat_run:
+            flags.append("repeated_text")
+        if metrics["high_compression_segments"] > options.max_high_compression_segments:
+            flags.append("high_compression")
+        if has_audio and metrics["coverage"] < options.min_coverage:
+            flags.append("low_coverage")
+    return {"flags": flags, "metrics": metrics}
+
+
+def quality_rank(assessment: dict) -> tuple:
+    """Sort key for attempts: fewer flags, then more coverage, then shorter loops."""
+    metrics = assessment["metrics"]
+    return (
+        len(assessment["flags"]),
+        metrics["high_compression_segments"],
+        -metrics["coverage"],
+        metrics["max_repeat_run"],
+    )
+
+
+def retry_temperatures(retry: int) -> tuple[float, ...]:
+    """Temperature fallback for the nth retry: (0.2, 0.4), then (0.4, 0.6), ..."""
+    first = min(RETRY_TEMPERATURE_STEP * retry, MAX_RETRY_TEMPERATURE)
+    second = min(first + RETRY_TEMPERATURE_STEP, MAX_RETRY_TEMPERATURE)
+    return tuple(sorted({round(first, 2), round(second, 2)}))
+
+
+def max_repeat_run(segments: list[dict]) -> int:
+    longest = 0
+    run = 0
+    previous = None
+    for segment in segments:
+        text = normalize_duplicate_text(str(segment.get("text", "")))
+        run = run + 1 if text and text == previous else 1
+        previous = text
+        if text:
+            longest = max(longest, run)
+    return longest
+
+
+def segment_coverage(segments: list[dict], duration: float) -> float:
+    if duration <= 0:
+        return 0.0
+    spans = sorted(
+        (
+            max(0.0, float(segment.get("start", 0) or 0)),
+            min(duration, float(segment.get("end", 0) or 0)),
+        )
+        for segment in segments
+    )
+    covered = 0.0
+    cursor = 0.0
+    for start, end in spans:
+        start = max(start, cursor)
+        if end > start:
+            covered += end - start
+            cursor = end
+    return covered / duration
+
+
+def active_audio_share(audio: np.ndarray, sample_rate: int, threshold: float) -> float:
+    frame = int(sample_rate * ENERGY_FRAME_SECONDS)
+    frame_count = len(audio) // frame
+    if frame_count < 1:
+        return 0.0
+    frames = audio[: frame_count * frame].astype(np.float32).reshape(frame_count, frame)
+    rms = np.sqrt(np.mean(frames**2, axis=1))
+    return float(np.mean(rms >= threshold))

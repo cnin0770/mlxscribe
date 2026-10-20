@@ -3,9 +3,12 @@ import numpy as np
 from mlxscribe.chunking import (
     SAMPLE_RATE,
     Chunk,
+    assess_chunk,
     merge_chunk_results,
     offset_result,
     plan_chunks,
+    quality_rank,
+    retry_temperatures,
     slice_audio,
     snap_chunks_to_quiet,
 )
@@ -123,3 +126,65 @@ def test_merge_chunk_results_sorts_and_renumbers_segments() -> None:
     assert [segment["chunk_index"] for segment in merged["segments"]] == [0, 1]
     assert merged["text"] == "firstsecond"
     assert merged["language"] == "ja"
+
+
+def segment(start: float, end: float, text: str, compression_ratio: float = 1.2) -> dict:
+    return {"start": start, "end": end, "text": text, "compression_ratio": compression_ratio}
+
+
+def test_assess_chunk_passes_clean_speech() -> None:
+    result = {"segments": [segment(0.0, 4.0, "こんにちは"), segment(4.0, 9.0, "元気ですか")]}
+
+    assessment = assess_chunk(result, tone(10))
+
+    assert assessment["flags"] == []
+    assert assessment["metrics"]["coverage"] == 0.9
+    assert assessment["metrics"]["max_repeat_run"] == 1
+
+
+def test_assess_chunk_flags_repeated_text_loop() -> None:
+    segments = [segment(index, index + 1, "ありがとう。") for index in range(6)]
+
+    assessment = assess_chunk({"segments": segments}, tone(6))
+
+    assert "repeated_text" in assessment["flags"]
+    assert assessment["metrics"]["max_repeat_run"] == 6
+
+
+def test_assess_chunk_flags_high_compression() -> None:
+    result = {"segments": [segment(0.0, 9.0, "ああああああ", compression_ratio=3.1)]}
+
+    assessment = assess_chunk(result, tone(10))
+
+    assert assessment["flags"] == ["high_compression"]
+    assert assessment["metrics"]["max_compression_ratio"] == 3.1
+
+
+def test_assess_chunk_flags_low_coverage_only_with_audio() -> None:
+    result = {"segments": [segment(0.0, 1.0, "はい")]}
+
+    assert assess_chunk(result, tone(20))["flags"] == ["low_coverage"]
+    assert assess_chunk(result, silence(20))["flags"] == []
+
+
+def test_assess_chunk_flags_no_segments_only_with_audio() -> None:
+    assert assess_chunk({"segments": []}, tone(20))["flags"] == ["no_segments"]
+    assert assess_chunk({"segments": []}, silence(20))["flags"] == []
+
+
+def test_quality_rank_prefers_fewer_flags_then_coverage() -> None:
+    looping = {"flags": ["repeated_text"], "metrics": metrics(coverage=0.9)}
+    sparse = {"flags": [], "metrics": metrics(coverage=0.4)}
+    full = {"flags": [], "metrics": metrics(coverage=0.8)}
+
+    assert min([looping, sparse, full], key=quality_rank) is full
+
+
+def metrics(coverage: float) -> dict:
+    return {"coverage": coverage, "high_compression_segments": 0, "max_repeat_run": 1}
+
+
+def test_retry_temperatures_step_up_and_cap() -> None:
+    assert retry_temperatures(1) == (0.2, 0.4)
+    assert retry_temperatures(2) == (0.4, 0.6)
+    assert retry_temperatures(5) == (1.0,)
