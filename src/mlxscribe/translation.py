@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from mlxscribe.exporters.json_exporter import write_json
 from mlxscribe.exporters.srt import write_srt
 from mlxscribe.exporters.txt import write_txt
+from mlxscribe.jobs import Checkpoint, ProgressWriter, content_hash
 
 DEFAULT_TRANSLATION_MODEL = "gpt-5.5"
 DEFAULT_MAX_SEGMENTS_PER_BATCH = 40
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_RETRY_DELAY_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -65,40 +70,134 @@ def output_multiplier(target_language: str) -> float:
     return 1.2
 
 
+def create_openai_client() -> object:
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("openai package is not installed; run `uv sync` first") from exc
+    return OpenAI()
+
+
+def translation_fingerprint(
+    segments: list[dict],
+    *,
+    source_language: str | None,
+    target_language: str,
+    model: str,
+    max_segments_per_batch: int,
+) -> dict:
+    """Settings that decide what each batch returns; a change invalidates saved batches."""
+    return {
+        "segments_sha256": content_hash([[segment["id"], segment["text"]] for segment in segments]),
+        "segments": len(segments),
+        "source_language": source_language,
+        "target_language": target_language,
+        "model": model,
+        "batch_size": max_segments_per_batch,
+        "instructions_sha256": content_hash(translation_instructions(target_language)),
+    }
+
+
 def translate_segments_openai(
     segments: list[dict],
     *,
     target_language: str,
     model: str,
     max_segments_per_batch: int,
+    client: object | None = None,
+    checkpoint: Checkpoint | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    progress: ProgressWriter | None = None,
 ) -> tuple[list[dict], dict]:
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("openai package is not installed; run `uv sync` first") from exc
+    """Translate in batches, saving each finished batch to ``checkpoint`` as it completes.
 
-    client = OpenAI()
+    A failed request (or an unparseable reply) is retried up to ``max_attempts`` times with
+    exponential backoff. Batches already in ``checkpoint`` are reused without an API call.
+    """
+    progress = progress or ProgressWriter()
     translated: list[dict] = []
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "batches": 0}
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "batches": 0, "resumed_batches": 0}
+    batches = list(batched(segments, max_segments_per_batch))
 
-    for batch in batched(segments, max_segments_per_batch):
-        response = client.responses.create(
+    for index, batch in enumerate(batches):
+        name = f"batch-{index:04d}"
+        saved = checkpoint.load(name) if checkpoint else None
+        if saved is not None:
+            translated.extend(saved["segments"])
+            merge_usage(usage, saved["usage"])
+            usage["resumed_batches"] += 1
+            progress.emit("batch", index=index, total=len(batches), status="resumed")
+            continue
+
+        if client is None:
+            client = create_openai_client()
+        progress.emit("batch", index=index, total=len(batches), status="started")
+        translations, response = request_batch(
+            client,
+            batch,
+            target_language=target_language,
             model=model,
-            instructions=translation_instructions(target_language),
-            input=json.dumps(
-                [{"id": segment["id"], "text": segment["text"]} for segment in batch],
-                ensure_ascii=False,
-            ),
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            sleep=sleep,
+            label=f"batch {index + 1}/{len(batches)}",
+            progress=progress,
+            index=index,
         )
-        translations = parse_translation_response(response.output_text)
         by_id = {item["id"]: item["text"] for item in translations}
+        batch_translated = []
         for segment in batch:
             translated_segment = {**segment, "source_text": segment["text"]}
             translated_segment["text"] = by_id.get(segment["id"], segment["text"])
-            translated.append(translated_segment)
-        add_usage(usage, response)
+            batch_translated.append(translated_segment)
+        batch_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "batches": 0}
+        add_usage(batch_usage, response)
+        if checkpoint:
+            checkpoint.save(name, {"segments": batch_translated, "usage": batch_usage})
+        translated.extend(batch_translated)
+        merge_usage(usage, batch_usage)
+        progress.emit("batch", index=index, total=len(batches), status="done")
 
     return translated, usage
+
+
+def request_batch(
+    client: object,
+    batch: list[dict],
+    *,
+    target_language: str,
+    model: str,
+    max_attempts: int,
+    retry_delay: float,
+    sleep: Callable[[float], None],
+    label: str,
+    progress: ProgressWriter,
+    index: int,
+) -> tuple[list[dict], object]:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.responses.create(
+                model=model,
+                instructions=translation_instructions(target_language),
+                input=json.dumps(
+                    [{"id": segment["id"], "text": segment["text"]} for segment in batch],
+                    ensure_ascii=False,
+                ),
+            )
+            return parse_translation_response(response.output_text), response
+        except Exception as exc:
+            if attempt == max_attempts:
+                raise RuntimeError(
+                    f"{label} failed after {max_attempts} attempt(s): {exc}. "
+                    "Finished batches are saved; rerun the same command to resume."
+                ) from exc
+            delay = retry_delay * 2 ** (attempt - 1)
+            print(f"  {label} attempt {attempt} failed ({exc}); retrying in {delay:g}s", file=sys.stderr)
+            progress.emit("batch", index=index, status="retrying", attempt=attempt, error=str(exc))
+            sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def translation_instructions(target_language: str) -> str:
@@ -142,6 +241,11 @@ def add_usage(usage: dict, response: object) -> None:
     usage["input_tokens"] += input_tokens
     usage["output_tokens"] += output_tokens
     usage["total_tokens"] += total_tokens
+
+
+def merge_usage(usage: dict, other: dict) -> None:
+    for key in ("input_tokens", "output_tokens", "total_tokens", "batches"):
+        usage[key] += other.get(key, 0)
 
 
 def batched(items: list[dict], size: int) -> Iterable[list[dict]]:

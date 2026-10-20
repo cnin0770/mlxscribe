@@ -6,7 +6,7 @@
 - Per-chunk retry behavior
 - Loop and hallucination reporting
 - Optional VAD or speech detection
-- Resume partial jobs
+- Resume partial jobs (done: chunk and translation-batch checkpoints)
 - Full-file versus chunked benchmark comparison
 
 Goal: long videos should be boringly reliable.

@@ -264,3 +264,119 @@ def test_filter_refuses_to_overwrite_its_input(tmp_path) -> None:
 
 def test_transcript_stem_round_trips_output_name(tmp_path) -> None:
     assert transcript_stem(tmp_path / "movie.ja.json", "ja") == "movie"
+
+
+def run_resumable(tmp_path, monkeypatch, *extra: str, fail_at: int | None = None) -> tuple[int, list[int]]:
+    """Transcribe a 3-minute file in 1-minute chunks; raise KeyboardInterrupt on chunk ``fail_at``."""
+    input_path = tmp_path / "movie.mp4"
+    if not input_path.exists():
+        input_path.write_bytes(b"movie")
+    calls = []
+
+    def fake_transcribe_audio(audio, **kwargs):
+        if len(calls) == fail_at:
+            raise KeyboardInterrupt
+        calls.append(len(calls))
+        return {
+            "language": "ja",
+            "segments": [{"id": 0, "start": 1.0, "end": 2.0, "text": f"{kwargs['model']} {len(calls)}"}],
+        }
+
+    monkeypatch.setattr(cli, "probe_duration", lambda path: 180.0)
+    monkeypatch.setattr(cli, "extract_audio", lambda source, target: None)
+    monkeypatch.setattr(cli, "load_wav", lambda path: np.zeros(180 * 16000, dtype=np.float32))
+    monkeypatch.setattr(cli, "transcribe_audio", fake_transcribe_audio)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+
+    exit_code = cli.main(
+        [
+            "transcribe",
+            str(input_path),
+            "--output",
+            str(tmp_path / "out"),
+            "--formats",
+            "json",
+            "--chunk-minutes",
+            "1",
+            *extra,
+        ]
+    )
+    return exit_code, calls
+
+
+def read_texts(tmp_path) -> list[str]:
+    transcript = json.loads((tmp_path / "out" / "movie.ja.json").read_text(encoding="utf-8"))
+    return [segment["text"] for segment in transcript["segments"]]
+
+
+def test_interrupted_transcription_resumes_finished_chunks(tmp_path, monkeypatch, capsys) -> None:
+    work = tmp_path / "out" / ".mlxscribe-work" / "movie" / "transcribe"
+    progress = tmp_path / "progress.jsonl"
+
+    exit_code, calls = run_resumable(tmp_path, monkeypatch, fail_at=2)
+    assert exit_code == 130
+    assert calls == [0, 1]
+    manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["kind"] == "transcribe"
+    assert manifest["total"] == 3
+    assert manifest["completed"] == ["chunk-0000", "chunk-0001"]
+
+    exit_code, calls = run_resumable(tmp_path, monkeypatch, "--progress-jsonl", str(progress))
+    assert exit_code == 0
+    assert calls == [0]  # only the third chunk is transcribed again
+    assert "Resuming from" in capsys.readouterr().out
+    assert read_texts(tmp_path) == [f"{cli.DEFAULT_MODEL} {n}" for n in (1, 2, 1)]
+
+    benchmark = json.loads((tmp_path / "out" / "movie.benchmark.json").read_text(encoding="utf-8"))
+    assert benchmark["chunking"]["resumed_chunks"] == 2
+    assert [chunk["resumed"] for chunk in benchmark["chunking"]["chunks"]] == [True, True, False]
+    assert not (tmp_path / "out" / ".mlxscribe-work").exists()
+
+    events = [json.loads(line) for line in progress.read_text(encoding="utf-8").splitlines()]
+    chunk_events = [(event["index"], event["status"]) for event in events if event["event"] == "chunk"]
+    assert chunk_events == [(0, "resumed"), (1, "resumed"), (2, "started"), (2, "done")]
+    assert events[-1]["event"] == "job" and events[-1]["status"] == "complete"
+
+
+def test_changed_setting_invalidates_transcription_checkpoint(tmp_path, monkeypatch, capsys) -> None:
+    exit_code, _ = run_resumable(tmp_path, monkeypatch, fail_at=2)
+    assert exit_code == 130
+    capsys.readouterr()
+
+    exit_code, calls = run_resumable(tmp_path, monkeypatch, "--model", "other-model")
+    assert exit_code == 0
+    assert calls == [0, 1, 2]
+    assert "different settings (model); starting fresh" in capsys.readouterr().out
+    assert read_texts(tmp_path) == [f"other-model {n}" for n in (1, 2, 3)]
+
+
+def test_changed_input_invalidates_transcription_checkpoint(tmp_path, monkeypatch, capsys) -> None:
+    run_resumable(tmp_path, monkeypatch, fail_at=2)
+    (tmp_path / "movie.mp4").write_bytes(b"a different movie")
+    capsys.readouterr()
+
+    _, calls = run_resumable(tmp_path, monkeypatch)
+    assert calls == [0, 1, 2]
+    assert "different settings (input)" in capsys.readouterr().out
+
+
+def test_no_resume_discards_checkpoint_and_keep_work_keeps_it(tmp_path, monkeypatch) -> None:
+    run_resumable(tmp_path, monkeypatch, fail_at=2)
+
+    exit_code, calls = run_resumable(tmp_path, monkeypatch, "--no-resume", "--keep-work")
+    assert exit_code == 0
+    assert calls == [0, 1, 2]
+    manifest_path = tmp_path / "out" / ".mlxscribe-work" / "movie" / "transcribe" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert len(manifest["completed"]) == 3
+
+
+def test_work_dir_override_is_used_and_not_removed(tmp_path, monkeypatch) -> None:
+    work_dir = tmp_path / "work"
+    run_resumable(tmp_path, monkeypatch, "--work-dir", str(work_dir), fail_at=1)
+    assert (work_dir / "transcribe" / "chunk-0000.json").exists()
+
+    _, calls = run_resumable(tmp_path, monkeypatch, "--work-dir", str(work_dir))
+    assert calls == [0, 1]
+    assert work_dir.exists() and not (work_dir / "transcribe").exists()

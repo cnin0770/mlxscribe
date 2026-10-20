@@ -118,6 +118,32 @@ uv run mlxscribe filter ./out/movie.ja.json --output ./out-filtered
 
 The benchmark file includes phase timings for probing, audio extraction, transcription, export, and total runtime.
 
+## Resuming interrupted jobs
+
+Long jobs save their progress as they go. `transcribe` saves each finished chunk (after any retry), and `translate --engine openai` saves each translated batch, so an interrupted run, a crash, or a failed API request does not throw away finished work. Run the same command again and mlxscribe skips what is already done:
+
+```text
+Resuming from out/.mlxscribe-work/movie/transcribe: 3/9 already done.
+Transcribing chunks...
+  chunk 1/9: 00:00.00-05:00.37 (saved, skipped)
+  ...
+```
+
+Saved work is reused only when nothing that affects the result changed. For `transcribe` that is the input file (size, modification time and a hash of its first and last MiB), model, language, task, temperature, word timestamps, context mode, the chunk boundaries, `--chunk-retries` and the chunk quality thresholds. For `translate` it is the source segments, source and target language, model, batch size and prompt. When any of these differ, mlxscribe says which and starts fresh. Resume applies to chunked transcription only; a file short enough to transcribe in one pass has nothing to resume.
+
+An OpenAI request that fails, or returns something that is not the expected JSON, is retried with exponential backoff: `--max-attempts` (default 3) attempts per batch, waiting `--retry-delay` seconds (default 2) and doubling after each failure. If a batch still fails, the command stops with an error, and the batches already paid for stay saved for the next run. Token counts printed after a resumed run include the saved batches.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--resume` / `--no-resume` | resume | Reuse matching saved work, or discard it and start fresh |
+| `--keep-work` | | Keep the work directory after a successful run |
+| `--work-dir DIR` | `<output>/.mlxscribe-work/<input name>` | Where saved work goes |
+| `--progress-jsonl FILE` | | Append progress events as JSON lines |
+
+Work lives in `<output>/.mlxscribe-work/<input name>/transcribe/` or `.../translate.<lang>/` and is deleted after a fully successful run. Each holds a `manifest.json` (job kind, settings fingerprint, total units, finished units, and `status`: `running` or `complete`) and one JSON file per finished chunk or batch. The benchmark JSON counts `resumed_chunks` and marks each chunk `resumed: true` or `false`.
+
+`--progress-jsonl` writes one event per line, each with `event` and `time` (Unix seconds): `job` events with `status` `started`, `complete`, `failed` or `interrupted`; `phase` events for audio extraction and transcription; `chunk` events with `index`, `total`, `start`, `end` and `status` `started`, `done` or `resumed`; and `batch` events with `index`, `total` and `status` `started`, `retrying`, `done` or `resumed`.
+
 ## Subtitle cleanup
 
 Whisper segments are cut for decoding, not for reading: some run for 15 seconds, some flash for a tenth of a second, and none are wrapped. Before writing SRT and TXT, `transcribe`, `filter` and `translate` turn them into cues that are easy to watch:

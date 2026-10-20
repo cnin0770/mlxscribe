@@ -8,12 +8,14 @@ import shutil
 import sys
 import tempfile
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from mlxscribe import __version__
 from mlxscribe.benchmark import print_benchmark_summary
 from mlxscribe.chunking import (
     Chunk,
+    QualityOptions,
     assess_chunk,
     merge_chunk_results,
     offset_result,
@@ -29,15 +31,19 @@ from mlxscribe.exporters.srt import write_srt
 from mlxscribe.exporters.txt import write_txt
 from mlxscribe.filters import FilterOptions, filter_transcript
 from mlxscribe.formats import parse_formats
+from mlxscribe.jobs import Checkpoint, ProgressWriter, file_fingerprint, work_paths
 from mlxscribe.media import extract_audio, load_wav, probe_duration
 from mlxscribe.subtitles import SubtitleOptions, clean_subtitles
 from mlxscribe.transcripts import clean_segments, load_transcript, transcript_stem
 from mlxscribe.translation import (
+    DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_SEGMENTS_PER_BATCH,
+    DEFAULT_RETRY_DELAY_SECONDS,
     DEFAULT_TRANSLATION_MODEL,
     build_translated_result,
     estimate_translation_tokens,
     translate_segments_openai,
+    translation_fingerprint,
     write_translation_outputs,
 )
 
@@ -213,6 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_subtitle_arguments(transcribe_parser)
+    add_job_arguments(transcribe_parser, unit="chunk", plural="chunks")
     transcribe_parser.set_defaults(command="transcribe")
 
     filter_parser = subparsers.add_parser(
@@ -280,10 +287,64 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_SEGMENTS_PER_BATCH,
         help="Number of subtitle segments to translate per request.",
     )
+    translate_parser.add_argument(
+        "--max-attempts",
+        type=positive_int,
+        default=DEFAULT_MAX_ATTEMPTS,
+        help=(
+            "Attempts per batch before giving up, with exponential backoff between them. "
+            f"Defaults to {DEFAULT_MAX_ATTEMPTS}."
+        ),
+    )
+    translate_parser.add_argument(
+        "--retry-delay",
+        type=non_negative_float,
+        default=DEFAULT_RETRY_DELAY_SECONDS,
+        help=(
+            "Seconds to wait before the first retry; doubles after each failure. "
+            f"Defaults to {DEFAULT_RETRY_DELAY_SECONDS:g}."
+        ),
+    )
     add_subtitle_arguments(translate_parser)
+    add_job_arguments(translate_parser, unit="batch", plural="batches")
     translate_parser.set_defaults(command="translate")
 
     return parser
+
+
+def add_job_arguments(parser: argparse.ArgumentParser, *, unit: str, plural: str) -> None:
+    group = parser.add_argument_group(
+        "resume",
+        f"Each finished {unit} is saved to a work directory so an interrupted run can resume.",
+    )
+    group.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            f"Reuse {plural} saved by an earlier run with the same input and settings. "
+            "--no-resume discards them and starts fresh. Defaults to resume."
+        ),
+    )
+    group.add_argument(
+        "--keep-work",
+        action="store_true",
+        help="Keep the work directory after a successful run instead of deleting it.",
+    )
+    group.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Work directory. Defaults to <output>/.mlxscribe-work/<input name>.",
+    )
+    group.add_argument(
+        "--progress-jsonl",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=f"Append JSON-lines progress events (job, phase, {unit}) to this file.",
+    )
 
 
 def add_subtitle_arguments(parser: argparse.ArgumentParser) -> None:
@@ -469,6 +530,22 @@ def check_environment() -> int:
 
 
 def run_transcribe(args: argparse.Namespace) -> int:
+    progress = ProgressWriter(args.progress_jsonl)
+    progress.emit("job", kind="transcribe", status="started", input=str(args.input))
+    try:
+        return transcribe_job(args, progress)
+    except BaseException as exc:
+        progress.emit("job", kind="transcribe", status=job_failure_status(exc), error=str(exc))
+        raise
+    finally:
+        progress.close()
+
+
+def job_failure_status(exc: BaseException) -> str:
+    return "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+
+
+def transcribe_job(args: argparse.Namespace, progress: ProgressWriter) -> int:
     configure_huggingface_cache()
 
     input_path = args.input.expanduser().resolve()
@@ -519,6 +596,13 @@ def run_transcribe(args: argparse.Namespace) -> int:
         print(f"Chunks: off ({chunk_decision['reason']})")
     print(f"HF_HOME: {get_hf_home()}")
     print("Extracting audio...")
+    progress.emit("phase", phase="extract_audio", status="started")
+    job = {
+        "input_path": input_path,
+        "output_dir": output_dir,
+        "stem": stem,
+        "progress": progress,
+    }
 
     kept_audio_path = None
     if args.keep_audio is not None:
@@ -529,7 +613,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
         extract_audio(input_path, audio_path)
         phase_timings["extract_audio_seconds"] = time.perf_counter() - phase_started_at
         kept_audio_path = audio_path
-        result = run_transcription(args, audio_path, chunks)
+        result = run_transcription(args, audio_path, chunks, job)
         phase_timings["transcribe_seconds"] = result.pop("_elapsed_seconds")
     else:
         with tempfile.TemporaryDirectory(prefix="mlxscribe-") as temp_dir:
@@ -537,8 +621,11 @@ def run_transcribe(args: argparse.Namespace) -> int:
             phase_started_at = time.perf_counter()
             extract_audio(input_path, audio_path)
             phase_timings["extract_audio_seconds"] = time.perf_counter() - phase_started_at
-            result = run_transcription(args, audio_path, chunks)
+            result = run_transcription(args, audio_path, chunks, job)
             phase_timings["transcribe_seconds"] = result.pop("_elapsed_seconds")
+
+    checkpoint, prune = result.pop("_checkpoint", (None, ()))
+    progress.emit("phase", phase="transcribe", status="done")
 
     filter_summary = None
     if args.filter_noise:
@@ -589,6 +676,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
             "retried_chunks": sum(
                 len(chunk["quality"]["attempts"]) > 1 for chunk in result.get("chunks", [])
             ),
+            "resumed_chunks": sum(chunk.get("resumed", False) for chunk in result.get("chunks", [])),
             "chunks": result.get("chunks", []),
         },
         "hf_home": str(get_hf_home()),
@@ -608,6 +696,10 @@ def run_transcribe(args: argparse.Namespace) -> int:
     }
     benchmark_path = output_dir / f"{stem}.benchmark.json"
     benchmark_path.write_text(json.dumps(benchmark, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if checkpoint is not None:
+        checkpoint.finish(keep=args.keep_work, prune=prune)
+    progress.emit("job", kind="transcribe", status="complete", output_dir=str(output_dir))
 
     print(f"Wrote outputs to {output_dir}")
     if source_duration:
@@ -685,13 +777,40 @@ def run_translate(args: argparse.Namespace) -> int:
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is required for --engine openai")
 
-    started_at = time.perf_counter()
-    translated_segments, usage = translate_segments_openai(
-        segments,
-        target_language=args.target_language,
-        model=args.model,
-        max_segments_per_batch=args.batch_size,
+    work_path, prune = work_paths(output_dir, stem, f"translate.{args.target_language}", args.work_dir)
+    checkpoint, message = Checkpoint.open(
+        work_path,
+        kind="translate",
+        fingerprint=translation_fingerprint(
+            segments,
+            source_language=source_language,
+            target_language=args.target_language,
+            model=args.model,
+            max_segments_per_batch=args.batch_size,
+        ),
+        total=batches,
+        resume=args.resume,
     )
+    if message:
+        print(message)
+    progress = ProgressWriter(args.progress_jsonl)
+    progress.emit("job", kind="translate", status="started", input=str(input_path), work_dir=str(work_path))
+    started_at = time.perf_counter()
+    try:
+        translated_segments, usage = translate_segments_openai(
+            segments,
+            target_language=args.target_language,
+            model=args.model,
+            max_segments_per_batch=args.batch_size,
+            checkpoint=checkpoint,
+            max_attempts=args.max_attempts,
+            retry_delay=args.retry_delay,
+            progress=progress,
+        )
+    except BaseException as exc:
+        progress.emit("job", kind="translate", status=job_failure_status(exc), error=str(exc))
+        progress.close()
+        raise
     elapsed = time.perf_counter() - started_at
     result = build_translated_result(
         source=source,
@@ -715,7 +834,13 @@ def run_translate(args: argparse.Namespace) -> int:
         target_language=args.target_language,
     )
 
+    checkpoint.finish(keep=args.keep_work, prune=prune)
+    progress.emit("job", kind="translate", status="complete", outputs=paths)
+    progress.close()
+
     print(f"Elapsed: {elapsed:.2f}s")
+    if usage["resumed_batches"]:
+        print(f"Resumed batches: {usage['resumed_batches']}/{usage['batches']} (tokens below include them)")
     print(f"Actual input tokens: {usage.get('input_tokens', 0)}")
     print(f"Actual output tokens: {usage.get('output_tokens', 0)}")
     print(f"Actual total tokens: {usage.get('total_tokens', 0)}")
@@ -767,9 +892,12 @@ def run_filter(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_transcription(args: argparse.Namespace, audio_path: Path, chunks: list[Chunk]) -> dict:
+def run_transcription(
+    args: argparse.Namespace, audio_path: Path, chunks: list[Chunk], job: dict
+) -> dict:
+    job["progress"].emit("phase", phase="transcribe", status="started", chunks=len(chunks))
     if chunks:
-        return run_chunked_engine(args, audio_path, chunks)
+        return run_chunked_engine(args, audio_path, chunks, job)
     return run_engine(args, audio_path)
 
 
@@ -791,21 +919,59 @@ def run_engine(args: argparse.Namespace, audio_path: Path) -> dict:
     return result
 
 
-def run_chunked_engine(args: argparse.Namespace, audio_path: Path, chunks: list[Chunk]) -> dict:
+def transcription_fingerprint(args: argparse.Namespace, input_path: Path, chunks: list[Chunk]) -> dict:
+    """Everything that decides a chunk's result; a change invalidates saved chunks."""
+    return {
+        "input": file_fingerprint(input_path),
+        "model": args.model,
+        "language": args.language,
+        "task": args.task,
+        "temperature": args.temperature,
+        "word_timestamps": args.word_timestamps,
+        "condition_on_previous_text": args.condition_on_previous_text,
+        "chunks": [[round(chunk.start, 3), round(chunk.end, 3)] for chunk in chunks],
+        "chunk_retries": args.chunk_retries,
+        "quality": asdict(QualityOptions()),
+    }
+
+
+def run_chunked_engine(
+    args: argparse.Namespace, audio_path: Path, chunks: list[Chunk], job: dict
+) -> dict:
     started_at = time.perf_counter()
+    progress: ProgressWriter = job["progress"]
     audio = load_wav(audio_path)
     planned_ends = [chunk.end for chunk in chunks]
     chunks = snap_chunks_to_quiet(chunks, audio)
+    work_path, prune = work_paths(job["output_dir"], job["stem"], "transcribe", args.work_dir)
+    checkpoint, message = Checkpoint.open(
+        work_path,
+        kind="transcribe",
+        fingerprint=transcription_fingerprint(args, job["input_path"], chunks),
+        total=len(chunks),
+        resume=args.resume,
+    )
+    progress.emit("phase", phase="transcribe_chunks", status="started", work_dir=str(work_path))
+    if message:
+        print(message)
     print("Transcribing chunks...")
     language = normalize_language(args.language)
     results = []
     chunk_reports = []
     for chunk in chunks:
         chunk_started_at = time.perf_counter()
-        print(
-            f"  chunk {chunk.index + 1}/{len(chunks)}: "
-            f"{format_seconds(chunk.start)}-{format_seconds(chunk.end)}"
-        )
+        span = f"{format_seconds(chunk.start)}-{format_seconds(chunk.end)}"
+        name = f"chunk-{chunk.index:04d}"
+        event = {"index": chunk.index, "total": len(chunks), "start": chunk.start, "end": chunk.end}
+        saved = checkpoint.load(name)
+        if saved is not None:
+            print(f"  chunk {chunk.index + 1}/{len(chunks)}: {span} (saved, skipped)")
+            results.append(saved["result"])
+            chunk_reports.append({**saved["report"], "resumed": True})
+            progress.emit("chunk", status="resumed", **event)
+            continue
+        print(f"  chunk {chunk.index + 1}/{len(chunks)}: {span}")
+        progress.emit("chunk", status="started", **event)
         chunk_audio = slice_audio(audio, chunk)
         attempts = []
         temperature = args.temperature
@@ -846,17 +1012,24 @@ def run_chunked_engine(args: argparse.Namespace, audio_path: Path, chunks: list[
         result = offset_result(chosen["_result"], chunk.start)
         for attempt in attempts:
             del attempt["_result"]
+        report = {
+            "elapsed_seconds": time.perf_counter() - chunk_started_at,
+            "quality": {
+                "flagged": bool(attempts[0]["flags"]),
+                "flags": chosen["flags"],
+                "chosen_attempt": chosen["attempt"],
+                "attempts": attempts,
+            },
+        }
+        checkpoint.save(name, {"result": result, "report": report})
         results.append(result)
-        chunk_reports.append(
-            {
-                "elapsed_seconds": time.perf_counter() - chunk_started_at,
-                "quality": {
-                    "flagged": bool(attempts[0]["flags"]),
-                    "flags": chosen["flags"],
-                    "chosen_attempt": chosen["attempt"],
-                    "attempts": attempts,
-                },
-            }
+        chunk_reports.append({**report, "resumed": False})
+        progress.emit(
+            "chunk",
+            status="done",
+            flags=chosen["flags"],
+            elapsed_seconds=round(report["elapsed_seconds"], 3),
+            **event,
         )
 
     merged = merge_chunk_results(results, chunks)
@@ -865,8 +1038,10 @@ def run_chunked_engine(args: argparse.Namespace, audio_path: Path, chunks: list[
     ):
         summary["elapsed_seconds"] = report["elapsed_seconds"]
         summary["planned_end"] = planned_end
+        summary["resumed"] = report["resumed"]
         summary["quality"] = report["quality"]
     merged["_elapsed_seconds"] = time.perf_counter() - started_at
+    merged["_checkpoint"] = (checkpoint, prune)
     return merged
 
 
