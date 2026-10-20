@@ -120,7 +120,7 @@ The benchmark file includes phase timings for probing, audio extraction, transcr
 
 ## Resuming interrupted jobs
 
-Long jobs save their progress as they go. `transcribe` saves each finished chunk (after any retry), and `translate --engine openai` saves each translated batch, so an interrupted run, a crash, or a failed API request does not throw away finished work. Run the same command again and mlxscribe skips what is already done:
+Long jobs save their progress as they go. `transcribe` saves each finished chunk (after any retry), and `translate --engine openai` and `--engine apple` save each translated batch, so an interrupted run, a crash, or a failed API request does not throw away finished work. Run the same command again and mlxscribe skips what is already done:
 
 ```text
 Resuming from out/.mlxscribe-work/movie/transcribe: 3/9 already done.
@@ -129,7 +129,7 @@ Transcribing chunks...
   ...
 ```
 
-Saved work is reused only when nothing that affects the result changed. For `transcribe` that is the input file (size, modification time and a hash of its first and last MiB), model, language, task, temperature, word timestamps, context mode, the chunk boundaries, `--chunk-retries` and the chunk quality thresholds. For `translate` it is the source segments, source and target language, model, batch size and prompt. When any of these differ, mlxscribe says which and starts fresh. Resume applies to chunked transcription only; a file short enough to transcribe in one pass has nothing to resume.
+Saved work is reused only when nothing that affects the result changed. For `transcribe` that is the input file (size, modification time and a hash of its first and last MiB), model, language, task, temperature, word timestamps, context mode, the chunk boundaries, `--chunk-retries` and the chunk quality thresholds. For `translate` it is the source segments, source and target language, engine, model (the macOS version for `apple`), batch size and, for `openai`, the prompt. When any of these differ, mlxscribe says which and starts fresh. Resume applies to chunked transcription only; a file short enough to transcribe in one pass has nothing to resume.
 
 An OpenAI request that fails, or returns something that is not the expected JSON, is retried with exponential backoff: `--max-attempts` (default 3) attempts per batch, waiting `--retry-delay` seconds (default 2) and doubling after each failure. If a batch still fails, the command stops with an error, and the batches already paid for stay saved for the next run. Token counts printed after a resumed run include the saved batches.
 
@@ -182,6 +182,29 @@ uv run mlxscribe summary out/*.benchmark.json
 
 ## Translation
 
+Whisper only transcribes; translation is a separate step on the transcript JSON. There are three engines:
+
+| Engine | Cost | Runs | Notes |
+|---|---|---|---|
+| `estimate` (default) | free | locally | Counts tokens for an OpenAI run; translates nothing |
+| `apple` | free | on device, offline | macOS Translation framework; translates each line on its own |
+| `openai` | paid per token | OpenAI API | Sees the surrounding lines, so it handles names and dialogue better |
+
+### Apple (free, on device)
+
+```bash
+uv run mlxscribe translate ./out/movie.ja.json --to zh-Hans --engine apple --output ./out
+uv run mlxscribe translate ./out/movie.ja.json --to en --engine apple --output ./out
+```
+
+It needs Xcode's command-line tools (`xcode-select --install`) and the language pack for the pair. The first run builds a small Swift helper into `~/Library/Caches/mlxscribe/` (set `MLXSCRIBE_CACHE_DIR` to move it); later runs reuse it. Before translating, mlxscribe checks the pair. If the pack is missing, it stops and tells you to install it in System Settings > General > Language & Region > Translation Languages. `mlxscribe check` reports whether the helper can be built.
+
+Language codes are Apple's: `ja`, `en`, `zh-Hans` (Simplified Chinese), `zh-Hant` (Traditional), `ko`, and so on. A transcript whose language is `zh` is read as `zh-Hans`.
+
+Apple Translation translates each segment without the lines around it. On a 120-minute Japanese drama it ran at about 3.5 segments per second and gave usable drafts, but it guesses the subject when Japanese leaves it out and it can lose slang, wordplay and large numbers. Use it for quick, free drafts and use `openai` for subtitles you will publish.
+
+### OpenAI
+
 Estimate token use without making an API call:
 
 ```bash
@@ -198,6 +221,8 @@ uv run mlxscribe translate ./out/movie.ja.json \
   --output ./out \
   --engine openai
 ```
+
+Both `apple` and `openai` translate in batches of `--batch-size` segments (default 40), retry a failed batch up to `--max-attempts` times, and save each finished batch so an interrupted run resumes (see [Resuming interrupted jobs](#resuming-interrupted-jobs)). The output JSON records the engine under `translation.engine` and, for Apple, the macOS version under `translation.model`; a macOS update starts a fresh translation instead of mixing in batches from the old version.
 
 Translation preserves segment timestamps and writes translated JSON, SRT, and TXT files.
 

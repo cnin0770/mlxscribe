@@ -11,7 +11,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from mlxscribe import __version__
+from mlxscribe import __version__, apple_translation
 from mlxscribe.benchmark import print_benchmark_summary
 from mlxscribe.chunking import (
     Chunk,
@@ -42,6 +42,7 @@ from mlxscribe.translation import (
     DEFAULT_TRANSLATION_MODEL,
     build_translated_result,
     estimate_translation_tokens,
+    translate_segments,
     translate_segments_openai,
     translation_fingerprint,
     write_translation_outputs,
@@ -272,9 +273,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     translate_parser.add_argument(
         "--engine",
-        choices=("estimate", "openai"),
+        choices=("estimate", "openai", "apple"),
         default="estimate",
-        help="Translation engine. Defaults to estimate, which spends no API tokens.",
+        help=(
+            "Translation engine: estimate (default) counts tokens without translating, "
+            "openai uses the OpenAI API, apple uses macOS on-device translation (free, offline)."
+        ),
     )
     translate_parser.add_argument(
         "--model",
@@ -526,7 +530,18 @@ def check_environment() -> int:
     else:
         print("HF cache: will be created on first model download")
 
+    # Optional: only `translate --engine apple` needs it, so it never fails the check.
+    print(f"Apple Translation: {describe_apple_translation()}")
+
     return 0 if ok else 1
+
+
+def describe_apple_translation() -> str:
+    if apple_translation.helper_path().exists():
+        return f"helper built ({apple_translation.helper_path()})"
+    if shutil.which("swiftc"):
+        return "available; the helper is built on first use"
+    return "unavailable (needs swiftc: `xcode-select --install`)"
 
 
 def run_transcribe(args: argparse.Namespace) -> int:
@@ -749,10 +764,11 @@ def run_translate(args: argparse.Namespace) -> int:
     print(f"Segments: {len(segments)}")
     print(f"Target: {args.target_language}")
     print(f"Engine: {args.engine}")
-    print(f"Estimated prompt tokens: {estimate.prompt_tokens}")
-    print(f"Estimated output tokens: {estimate.expected_output_tokens}")
-    print(f"Estimated total tokens: {estimate.total_tokens}")
-    print(f"Tokenizer: {estimate.tokenizer}")
+    if args.engine != "apple":
+        print(f"Estimated prompt tokens: {estimate.prompt_tokens}")
+        print(f"Estimated output tokens: {estimate.expected_output_tokens}")
+        print(f"Estimated total tokens: {estimate.total_tokens}")
+        print(f"Tokenizer: {estimate.tokenizer}")
     print(f"Batches: {batches}")
 
     stem = transcript_stem(input_path, source_language)
@@ -774,8 +790,19 @@ def run_translate(args: argparse.Namespace) -> int:
         print("No API call was made.")
         return 0
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is required for --engine openai")
+    if args.engine == "apple":
+        if not source_language:
+            raise ValueError("the transcript has no language; pass --from, for example --from ja")
+        translator = apple_translation.AppleTranslator(source_language, args.target_language)
+        apple_translation.check_language_pair(
+            source_language, args.target_language, helper=translator.helper
+        )
+        model = f"macOS {apple_translation.macos_version()}"
+        print(f"Model: Apple Translation ({model})")
+    else:
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise RuntimeError("OPENAI_API_KEY is required for --engine openai")
+        model = args.model
 
     work_path, prune = work_paths(output_dir, stem, f"translate.{args.target_language}", args.work_dir)
     checkpoint, message = Checkpoint.open(
@@ -785,8 +812,9 @@ def run_translate(args: argparse.Namespace) -> int:
             segments,
             source_language=source_language,
             target_language=args.target_language,
-            model=args.model,
+            model=model,
             max_segments_per_batch=args.batch_size,
+            engine=args.engine,
         ),
         total=batches,
         resume=args.resume,
@@ -797,16 +825,27 @@ def run_translate(args: argparse.Namespace) -> int:
     progress.emit("job", kind="translate", status="started", input=str(input_path), work_dir=str(work_path))
     started_at = time.perf_counter()
     try:
-        translated_segments, usage = translate_segments_openai(
-            segments,
-            target_language=args.target_language,
-            model=args.model,
-            max_segments_per_batch=args.batch_size,
-            checkpoint=checkpoint,
-            max_attempts=args.max_attempts,
-            retry_delay=args.retry_delay,
-            progress=progress,
-        )
+        if args.engine == "apple":
+            translated_segments, usage = translate_segments(
+                segments,
+                translate_batch=translator,
+                max_segments_per_batch=args.batch_size,
+                checkpoint=checkpoint,
+                max_attempts=args.max_attempts,
+                retry_delay=args.retry_delay,
+                progress=progress,
+            )
+        else:
+            translated_segments, usage = translate_segments_openai(
+                segments,
+                target_language=args.target_language,
+                model=model,
+                max_segments_per_batch=args.batch_size,
+                checkpoint=checkpoint,
+                max_attempts=args.max_attempts,
+                retry_delay=args.retry_delay,
+                progress=progress,
+            )
     except BaseException as exc:
         progress.emit("job", kind="translate", status=job_failure_status(exc), error=str(exc))
         progress.close()
@@ -817,8 +856,8 @@ def run_translate(args: argparse.Namespace) -> int:
         source_language=source_language,
         target_language=args.target_language,
         translated_segments=translated_segments,
-        model=args.model,
-        engine="openai",
+        model=model,
+        engine=args.engine,
         token_estimate=estimate,
         usage=usage,
     )
@@ -839,11 +878,18 @@ def run_translate(args: argparse.Namespace) -> int:
     progress.close()
 
     print(f"Elapsed: {elapsed:.2f}s")
-    if usage["resumed_batches"]:
-        print(f"Resumed batches: {usage['resumed_batches']}/{usage['batches']} (tokens below include them)")
-    print(f"Actual input tokens: {usage.get('input_tokens', 0)}")
-    print(f"Actual output tokens: {usage.get('output_tokens', 0)}")
-    print(f"Actual total tokens: {usage.get('total_tokens', 0)}")
+    if args.engine == "apple":
+        if usage["resumed_batches"]:
+            print(f"Resumed batches: {usage['resumed_batches']}/{usage['batches']}")
+    else:
+        if usage["resumed_batches"]:
+            print(
+                f"Resumed batches: {usage['resumed_batches']}/{usage['batches']} "
+                "(tokens below include them)"
+            )
+        print(f"Actual input tokens: {usage.get('input_tokens', 0)}")
+        print(f"Actual output tokens: {usage.get('output_tokens', 0)}")
+        print(f"Actual total tokens: {usage.get('total_tokens', 0)}")
     print(f"Wrote JSON: {paths['json']}")
     print(f"Wrote SRT: {paths['srt']}")
     print(f"Wrote TXT: {paths['txt']}")

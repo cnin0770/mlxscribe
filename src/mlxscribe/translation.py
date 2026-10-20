@@ -85,17 +85,26 @@ def translation_fingerprint(
     target_language: str,
     model: str,
     max_segments_per_batch: int,
+    engine: str = "openai",
 ) -> dict:
     """Settings that decide what each batch returns; a change invalidates saved batches."""
-    return {
+    fingerprint = {
         "segments_sha256": content_hash([[segment["id"], segment["text"]] for segment in segments]),
         "segments": len(segments),
         "source_language": source_language,
         "target_language": target_language,
+        "engine": engine,
         "model": model,
         "batch_size": max_segments_per_batch,
-        "instructions_sha256": content_hash(translation_instructions(target_language)),
     }
+    if engine == "openai":
+        fingerprint["instructions_sha256"] = content_hash(translation_instructions(target_language))
+    return fingerprint
+
+
+# A batch translator takes ``[{"id", "text", ...}]`` and returns ``[{"id", "text"}]`` plus a
+# usage record (token counts for OpenAI, just ``{"batches": 1}`` for on-device engines).
+BatchTranslator = Callable[[list[dict]], tuple[list[dict], dict]]
 
 
 def translate_segments_openai(
@@ -111,10 +120,53 @@ def translate_segments_openai(
     sleep: Callable[[float], None] = time.sleep,
     progress: ProgressWriter | None = None,
 ) -> tuple[list[dict], dict]:
+    """Translate with the OpenAI Responses API; see ``translate_segments`` for batching."""
+    clients = [client]
+
+    def translate_batch(batch: list[dict]) -> tuple[list[dict], dict]:
+        if clients[0] is None:
+            clients[0] = create_openai_client()
+        response = clients[0].responses.create(
+            model=model,
+            instructions=translation_instructions(target_language),
+            input=json.dumps(
+                [{"id": segment["id"], "text": segment["text"]} for segment in batch],
+                ensure_ascii=False,
+            ),
+        )
+        batch_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "batches": 0}
+        translations = parse_translation_response(response.output_text)
+        add_usage(batch_usage, response)
+        return translations, batch_usage
+
+    return translate_segments(
+        segments,
+        translate_batch=translate_batch,
+        max_segments_per_batch=max_segments_per_batch,
+        checkpoint=checkpoint,
+        max_attempts=max_attempts,
+        retry_delay=retry_delay,
+        sleep=sleep,
+        progress=progress,
+    )
+
+
+def translate_segments(
+    segments: list[dict],
+    *,
+    translate_batch: BatchTranslator,
+    max_segments_per_batch: int,
+    checkpoint: Checkpoint | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    progress: ProgressWriter | None = None,
+) -> tuple[list[dict], dict]:
     """Translate in batches, saving each finished batch to ``checkpoint`` as it completes.
 
-    A failed request (or an unparseable reply) is retried up to ``max_attempts`` times with
-    exponential backoff. Batches already in ``checkpoint`` are reused without an API call.
+    A failed batch (an error or an unparseable reply) is retried up to ``max_attempts`` times
+    with exponential backoff. Batches already in ``checkpoint`` are reused without calling
+    ``translate_batch``.
     """
     progress = progress or ProgressWriter()
     translated: list[dict] = []
@@ -131,14 +183,10 @@ def translate_segments_openai(
             progress.emit("batch", index=index, total=len(batches), status="resumed")
             continue
 
-        if client is None:
-            client = create_openai_client()
         progress.emit("batch", index=index, total=len(batches), status="started")
-        translations, response = request_batch(
-            client,
+        translations, batch_usage = request_batch(
+            translate_batch,
             batch,
-            target_language=target_language,
-            model=model,
             max_attempts=max_attempts,
             retry_delay=retry_delay,
             sleep=sleep,
@@ -152,8 +200,6 @@ def translate_segments_openai(
             translated_segment = {**segment, "source_text": segment["text"]}
             translated_segment["text"] = by_id.get(segment["id"], segment["text"])
             batch_translated.append(translated_segment)
-        batch_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "batches": 0}
-        add_usage(batch_usage, response)
         if checkpoint:
             checkpoint.save(name, {"segments": batch_translated, "usage": batch_usage})
         translated.extend(batch_translated)
@@ -164,29 +210,19 @@ def translate_segments_openai(
 
 
 def request_batch(
-    client: object,
+    translate_batch: BatchTranslator,
     batch: list[dict],
     *,
-    target_language: str,
-    model: str,
     max_attempts: int,
     retry_delay: float,
     sleep: Callable[[float], None],
     label: str,
     progress: ProgressWriter,
     index: int,
-) -> tuple[list[dict], object]:
+) -> tuple[list[dict], dict]:
     for attempt in range(1, max_attempts + 1):
         try:
-            response = client.responses.create(
-                model=model,
-                instructions=translation_instructions(target_language),
-                input=json.dumps(
-                    [{"id": segment["id"], "text": segment["text"]} for segment in batch],
-                    ensure_ascii=False,
-                ),
-            )
-            return parse_translation_response(response.output_text), response
+            return translate_batch(batch)
         except Exception as exc:
             if attempt == max_attempts:
                 raise RuntimeError(
@@ -245,7 +281,7 @@ def add_usage(usage: dict, response: object) -> None:
 
 def merge_usage(usage: dict, other: dict) -> None:
     for key in ("input_tokens", "output_tokens", "total_tokens", "batches"):
-        usage[key] += other.get(key, 0)
+        usage[key] = usage.get(key, 0) + other.get(key, 0)
 
 
 def batched(items: list[dict], size: int) -> Iterable[list[dict]]:
