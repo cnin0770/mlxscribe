@@ -4,7 +4,7 @@ title: Add on-device Apple Translation engine
 status: In Progress
 assignee: []
 created_date: '2026-10-20 04:01'
-updated_date: '2026-10-20 04:02'
+updated_date: '2026-10-20 04:59'
 labels:
   - translation
 dependencies: []
@@ -38,4 +38,6 @@ Implemented on branch apple-translation (one commit on top of main). Remaining: 
 
 <!-- SECTION:NOTES:BEGIN -->
 Verified: 102 tests pass plus an opt-in test that compiles and runs the real Swift helper (MLXSCRIBE_APPLE_TESTS=1). 120m transcript (1721 segments, ja -> zh-Hans) took 493s, about 3.5 segments/s. Ctrl-C after 4/44 batches resumed and gave output identical to an uninterrupted run. Baseline: mean char-bigram F1 0.19 against OCR of the human Chinese subtitles. Quality is literal: no context between lines, guessed subjects, lost slang and wordplay, one wrong large number in English.
+
+User trial (MREC-013, ~1h; sample.5m): engine worked; feedback led to the progress bar and leading-silence fixes on the same branch.
 <!-- SECTION:NOTES:END -->

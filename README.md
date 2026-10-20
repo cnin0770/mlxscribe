@@ -16,6 +16,8 @@ uv run mlxscribe check
 uv run mlxscribe transcribe ./movie.mp4 --output ./out
 ```
 
+Expect about 10x realtime on Apple Silicon: an hour of video takes roughly 13 minutes. The defaults favour accurate subtitle timing; add `--skip-silence off` for about twice the speed with less accurate start times (see below).
+
 The default model is `mlx-community/whisper-large-v3-turbo`.
 
 Model downloads are cached in the project directory by default:
@@ -69,6 +71,8 @@ uv run mlxscribe transcribe ./movie.mp4 --output ./out --skip-silence off   # fa
 ```
 
 Without it, Whisper often stamps a line at the very start of the audio (00:00:00) when a video opens with music or noise, and stretches it to the first real words. Chunked runs did the same at every chunk start. `--skip-silence SECONDS` turns on word timestamps and skips silent or noise-only gaps longer than SECONDS, along with text Whisper invents over them. On a 45-minute drama it moved the first line from 0.0s to 10.7s (the burned-in subtitle appears at 11.0s), recovered the opening dialogue that was otherwise missed, and halved the median start-time error (0.57s to 0.35s). It roughly doubles transcription time (131s to 273s, still about 10x realtime). The setting is recorded as `skip_silence` in the benchmark JSON.
+
+It is the default because subtitle timing is what viewers notice. Two cheaper fixes using a speech detector (Silero VAD) were tried on the same file and rejected: moving segment starts onto detected speech barely helped, since most early lines sit inside continuous dialogue with no pause to find; and transcribing only detected speech was faster but lost a whole scene of quiet and phone-filtered dialogue the detector did not register.
 
 Progress is one bar for the whole file, in audio time, however the file is split internally. A chunk that is re-transcribed gets one line above the bar explaining why. The bar is drawn only in a terminal; logs and pipes get plain lines.
 
