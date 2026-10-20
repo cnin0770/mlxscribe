@@ -380,3 +380,47 @@ def test_work_dir_override_is_used_and_not_removed(tmp_path, monkeypatch) -> Non
     _, calls = run_resumable(tmp_path, monkeypatch, "--work-dir", str(work_dir))
     assert calls == [0, 1]
     assert work_dir.exists() and not (work_dir / "transcribe").exists()
+
+
+def capture_engine_kwargs(tmp_path, monkeypatch, *extra: str) -> list[dict]:
+    calls = []
+
+    def fake_transcribe_audio(audio, **kwargs):
+        calls.append(kwargs)
+        return {"language": "ja", "segments": CLEAN}
+
+    input_path = tmp_path / "movie.mp4"
+    input_path.write_bytes(b"")
+    monkeypatch.setattr(cli, "probe_duration", lambda path: 60.0)
+    monkeypatch.setattr(cli, "extract_audio", lambda source, target: None)
+    monkeypatch.setattr(cli, "load_wav", lambda path: np.zeros(60 * 16000, dtype=np.float32))
+    monkeypatch.setattr(cli, "transcribe_audio", fake_transcribe_audio)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    argv = ["transcribe", str(input_path), "--output", str(tmp_path / "out"), "--formats", "json"]
+    assert cli.main([*argv, *extra]) == 0
+    return calls
+
+
+def test_skip_silence_is_on_by_default_and_turns_on_word_timestamps(tmp_path, monkeypatch) -> None:
+    calls = capture_engine_kwargs(tmp_path, monkeypatch, "--chunk-minutes", "1")
+
+    assert calls[0]["skip_silence"] == cli.DEFAULT_SKIP_SILENCE_SECONDS
+    assert calls[0]["word_timestamps"] is True
+    benchmark = json.loads((tmp_path / "out" / "movie.benchmark.json").read_text(encoding="utf-8"))
+    assert benchmark["skip_silence"] == cli.DEFAULT_SKIP_SILENCE_SECONDS
+
+
+def test_skip_silence_off_keeps_the_fast_path(tmp_path, monkeypatch) -> None:
+    calls = capture_engine_kwargs(tmp_path, monkeypatch, "--skip-silence", "off")
+
+    assert calls[0]["skip_silence"] is None
+    assert calls[0]["word_timestamps"] is False
+
+
+def test_chunked_transcription_does_not_list_chunks(tmp_path, monkeypatch, capsys) -> None:
+    run_one_chunk(tmp_path, monkeypatch, [LOOP, CLEAN])
+
+    out = capsys.readouterr().out
+    assert "Chunks: 1 x 1 minute(s)" in out
+    assert "chunk 1/1" not in out
+    assert "Re-transcribing 00:00.00-01:00.00 at temperature 0.2, 0.4: the last pass had the same line repeated" in out

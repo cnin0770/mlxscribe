@@ -61,6 +61,17 @@ uv run mlxscribe transcribe ./movie.mp4 \
 
 The filter is opt-in. It removes empty or near-instant segments, low-confidence silence, and short repetitive leading hallucinations.
 
+Silence and background noise are skipped by default, so a subtitle starts when its speech starts:
+
+```bash
+uv run mlxscribe transcribe ./movie.mp4 --output ./out                      # --skip-silence 2
+uv run mlxscribe transcribe ./movie.mp4 --output ./out --skip-silence off   # fast path
+```
+
+Without it, Whisper often stamps a line at the very start of the audio (00:00:00) when a video opens with music or noise, and stretches it to the first real words. Chunked runs did the same at every chunk start. `--skip-silence SECONDS` turns on word timestamps and skips silent or noise-only gaps longer than SECONDS, along with text Whisper invents over them. On a 45-minute drama it moved the first line from 0.0s to 10.7s (the burned-in subtitle appears at 11.0s), recovered the opening dialogue that was otherwise missed, and halved the median start-time error (0.57s to 0.35s). It roughly doubles transcription time (131s to 273s, still about 10x realtime). The setting is recorded as `skip_silence` in the benchmark JSON.
+
+Progress is one bar for the whole file, in audio time, however the file is split internally. A chunk that is re-transcribed gets one line above the bar explaining why. The bar is drawn only in a terminal; logs and pipes get plain lines.
+
 Previous-text context defaults to auto:
 
 ```text
@@ -129,7 +140,7 @@ Transcribing chunks...
   ...
 ```
 
-Saved work is reused only when nothing that affects the result changed. For `transcribe` that is the input file (size, modification time and a hash of its first and last MiB), model, language, task, temperature, word timestamps, context mode, the chunk boundaries, `--chunk-retries` and the chunk quality thresholds. For `translate` it is the source segments, source and target language, engine, model (the macOS version for `apple`), batch size and, for `openai`, the prompt. When any of these differ, mlxscribe says which and starts fresh. Resume applies to chunked transcription only; a file short enough to transcribe in one pass has nothing to resume.
+Saved work is reused only when nothing that affects the result changed. For `transcribe` that is the input file (size, modification time and a hash of its first and last MiB), model, language, task, temperature, word timestamps, `--skip-silence`, context mode, the chunk boundaries, `--chunk-retries` and the chunk quality thresholds. For `translate` it is the source segments, source and target language, engine, model (the macOS version for `apple`), batch size and, for `openai`, the prompt. When any of these differ, mlxscribe says which and starts fresh. Resume applies to chunked transcription only; a file short enough to transcribe in one pass has nothing to resume.
 
 An OpenAI request that fails, or returns something that is not the expected JSON, is retried with exponential backoff: `--max-attempts` (default 3) attempts per batch, waiting `--retry-delay` seconds (default 2) and doubling after each failure. If a batch still fails, the command stops with an error, and the batches already paid for stay saved for the next run. Token counts printed after a resumed run include the saved batches.
 
@@ -172,7 +183,7 @@ uv run mlxscribe transcribe ./movie.mp4 --language ja --output ./out --max-line-
 uv run mlxscribe filter ./out/movie.json --output ./out-clean --min-cue-seconds 1.2
 ```
 
-The changes are recorded under `subtitles` in the benchmark JSON for `transcribe`, and in the output JSON for `filter` and `translate`. The record counts segments split, merged, extended and wrapped, overlaps fixed and cues trimmed to word timestamps. It also lists what cleanup could not fix: `remaining_long_lines`, `remaining_short_cues`, `remaining_long_cues` and `remaining_overlaps`. The usual leftover is `remaining_long_cues`: a cue such as "おかえりなさい" that Whisper stretched over 19 seconds of silence, with no word timestamps to trim it and no pause in the text to split at. Transcribe with `--word-timestamps` to fix most of these.
+The changes are recorded under `subtitles` in the benchmark JSON for `transcribe`, and in the output JSON for `filter` and `translate`. The record counts segments split, merged, extended and wrapped, overlaps fixed and cues trimmed to word timestamps. It also lists what cleanup could not fix: `remaining_long_lines`, `remaining_short_cues`, `remaining_long_cues` and `remaining_overlaps`. The usual leftover is `remaining_long_cues`: a cue such as "おかえりなさい" that Whisper stretched over 19 seconds of silence, with no word timestamps to trim it and no pause in the text to split at. The default `--skip-silence` turns on word timestamps, which fixes most of these; they mostly appear with `--skip-silence off`.
 
 ## Benchmarks
 
@@ -201,7 +212,7 @@ It needs Xcode's command-line tools (`xcode-select --install`) and the language 
 
 Language codes are Apple's: `ja`, `en`, `zh-Hans` (Simplified Chinese), `zh-Hant` (Traditional), `ko`, and so on. A transcript whose language is `zh` is read as `zh-Hans`.
 
-Apple Translation translates each segment without the lines around it. On a 120-minute Japanese drama it ran at about 3.5 segments per second and gave usable drafts, but it guesses the subject when Japanese leaves it out and it can lose slang, wordplay and large numbers. Use it for quick, free drafts and use `openai` for subtitles you will publish.
+Apple Translation translates each segment without the lines around it. On a 120-minute Japanese drama it ran at about 3.5 segments per second and gave usable drafts, but it guesses the subject when Japanese leaves it out and it can lose slang, wordplay and large numbers. Use it for quick, free drafts and use `openai` for subtitles you will publish. A progress bar counts translated segments and estimates the time left; it moves once per batch (about every 10 seconds with the default `--batch-size 40`).
 
 ### OpenAI
 

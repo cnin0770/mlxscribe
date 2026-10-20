@@ -69,3 +69,8 @@ def load_wav(path: Path) -> np.ndarray:
             raise ValueError(f"expected 16-bit mono wav: {path}")
         frames = reader.readframes(reader.getnframes())
     return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as reader:
+        return reader.getnframes() / reader.getframerate()

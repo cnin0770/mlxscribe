@@ -14,7 +14,8 @@ def transcribe_audio(
     word_timestamps: bool,
     temperature: float | tuple[float, ...],
     condition_on_previous_text: bool,
-    verbose: bool,
+    verbose: bool | None,
+    skip_silence: float | None = None,
 ) -> dict:
     import mlx_whisper
 
@@ -27,4 +28,7 @@ def transcribe_audio(
         temperature=temperature,
         condition_on_previous_text=condition_on_previous_text,
         verbose=verbose,
+        # Needs word timestamps: skips silent gaps longer than this and the text Whisper
+        # invents over them, and stops a segment from starting before its first word.
+        hallucination_silence_threshold=skip_silence,
     )

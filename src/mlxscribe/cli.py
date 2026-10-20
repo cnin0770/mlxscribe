@@ -32,7 +32,8 @@ from mlxscribe.exporters.txt import write_txt
 from mlxscribe.filters import FilterOptions, filter_transcript
 from mlxscribe.formats import parse_formats
 from mlxscribe.jobs import Checkpoint, ProgressWriter, file_fingerprint, work_paths
-from mlxscribe.media import extract_audio, load_wav, probe_duration
+from mlxscribe.media import extract_audio, load_wav, probe_duration, wav_duration
+from mlxscribe.progress_display import JobProgress, whisper_progress
 from mlxscribe.subtitles import SubtitleOptions, clean_subtitles
 from mlxscribe.transcripts import clean_segments, load_transcript, transcript_stem
 from mlxscribe.translation import (
@@ -56,6 +57,7 @@ LONG_FORM_THRESHOLD_SECONDS = 15 * 60
 CHUNK_AUTO = "auto"
 CHUNK_OFF = "off"
 DEFAULT_CHUNK_MINUTES = 5.0
+DEFAULT_SKIP_SILENCE_SECONDS = 2.0
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HF_HOME = PROJECT_ROOT / ".hf-cache"
 
@@ -146,6 +148,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--word-timestamps",
         action="store_true",
         help="Ask mlx-whisper for word-level timestamps.",
+    )
+    transcribe_parser.add_argument(
+        "--skip-silence",
+        type=parse_skip_silence,
+        default=DEFAULT_SKIP_SILENCE_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Skip silent or noise-only gaps longer than SECONDS, and the text Whisper invents "
+            "over them, so subtitles start when speech starts. Turns on --word-timestamps and "
+            "roughly doubles transcription time. 'off' is the fast path. "
+            f"Defaults to {DEFAULT_SKIP_SILENCE_SECONDS:g}."
+        ),
     )
     transcribe_parser.add_argument(
         "--temperature",
@@ -468,6 +482,12 @@ def parse_temperature(value: str) -> float | tuple[float, ...]:
     return values[0] if len(values) == 1 else values
 
 
+def parse_skip_silence(value: str) -> float | None:
+    if value.strip().lower() == "off":
+        return None
+    return positive_float(value)
+
+
 def parse_chunk_minutes(value: str) -> str | float:
     normalized = value.strip().lower()
     if normalized in (CHUNK_AUTO, CHUNK_OFF):
@@ -545,6 +565,8 @@ def describe_apple_translation() -> str:
 
 
 def run_transcribe(args: argparse.Namespace) -> int:
+    if args.skip_silence is not None:
+        args.word_timestamps = True
     progress = ProgressWriter(args.progress_jsonl)
     progress.emit("job", kind="transcribe", status="started", input=str(args.input))
     try:
@@ -617,6 +639,7 @@ def transcribe_job(args: argparse.Namespace, progress: ProgressWriter) -> int:
         "output_dir": output_dir,
         "stem": stem,
         "progress": progress,
+        "duration": source_duration,
     }
 
     kept_audio_path = None
@@ -674,6 +697,7 @@ def transcribe_job(args: argparse.Namespace, progress: ProgressWriter) -> int:
         "task": args.task,
         "formats": formats,
         "word_timestamps": args.word_timestamps,
+        "skip_silence": args.skip_silence,
         "temperature": args.temperature,
         "condition_on_previous_text": args.condition_on_previous_text,
         "condition_on_previous_text_requested": context_decision["requested"],
@@ -824,6 +848,7 @@ def run_translate(args: argparse.Namespace) -> int:
     progress = ProgressWriter(args.progress_jsonl)
     progress.emit("job", kind="translate", status="started", input=str(input_path), work_dir=str(work_path))
     started_at = time.perf_counter()
+    display = JobProgress(len(segments), desc="Translating", unit="segments")
     try:
         if args.engine == "apple":
             translated_segments, usage = translate_segments(
@@ -834,6 +859,7 @@ def run_translate(args: argparse.Namespace) -> int:
                 max_attempts=args.max_attempts,
                 retry_delay=args.retry_delay,
                 progress=progress,
+                display=display,
             )
         else:
             translated_segments, usage = translate_segments_openai(
@@ -845,11 +871,14 @@ def run_translate(args: argparse.Namespace) -> int:
                 max_attempts=args.max_attempts,
                 retry_delay=args.retry_delay,
                 progress=progress,
+                display=display,
             )
     except BaseException as exc:
         progress.emit("job", kind="translate", status=job_failure_status(exc), error=str(exc))
         progress.close()
         raise
+    finally:
+        display.close()
     elapsed = time.perf_counter() - started_at
     result = build_translated_result(
         source=source,
@@ -944,23 +973,31 @@ def run_transcription(
     job["progress"].emit("phase", phase="transcribe", status="started", chunks=len(chunks))
     if chunks:
         return run_chunked_engine(args, audio_path, chunks, job)
-    return run_engine(args, audio_path)
+    return run_engine(args, audio_path, job.get("duration"))
 
 
-def run_engine(args: argparse.Namespace, audio_path: Path) -> dict:
-    print("Transcribing...")
+def run_engine(args: argparse.Namespace, audio_path: Path, duration: float | None = None) -> dict:
     started_at = time.perf_counter()
     language = normalize_language(args.language)
-    result = transcribe_audio(
-        audio_path,
-        model=args.model,
-        language=language,
-        task=args.task,
-        word_timestamps=args.word_timestamps,
-        temperature=args.temperature,
-        condition_on_previous_text=args.condition_on_previous_text,
-        verbose=args.verbose_engine,
-    )
+    if duration is None:
+        duration = wav_duration(audio_path)
+    display = JobProgress(duration, desc="Transcribing", unit="s", clock=True)
+    try:
+        with whisper_progress(display):
+            result = transcribe_audio(
+                audio_path,
+                model=args.model,
+                language=language,
+                task=args.task,
+                word_timestamps=args.word_timestamps,
+                temperature=args.temperature,
+                condition_on_previous_text=args.condition_on_previous_text,
+                verbose=args.verbose_engine,
+                skip_silence=args.skip_silence,
+            )
+        display.advance_to(display.total)
+    finally:
+        display.close()
     result["_elapsed_seconds"] = time.perf_counter() - started_at
     return result
 
@@ -974,6 +1011,7 @@ def transcription_fingerprint(args: argparse.Namespace, input_path: Path, chunks
         "task": args.task,
         "temperature": args.temperature,
         "word_timestamps": args.word_timestamps,
+        "skip_silence": args.skip_silence,
         "condition_on_previous_text": args.condition_on_previous_text,
         "chunks": [[round(chunk.start, 3), round(chunk.end, 3)] for chunk in chunks],
         "chunk_retries": args.chunk_retries,
@@ -1000,83 +1038,24 @@ def run_chunked_engine(
     progress.emit("phase", phase="transcribe_chunks", status="started", work_dir=str(work_path))
     if message:
         print(message)
-    print("Transcribing chunks...")
     language = normalize_language(args.language)
     results = []
     chunk_reports = []
-    for chunk in chunks:
-        chunk_started_at = time.perf_counter()
-        span = f"{format_seconds(chunk.start)}-{format_seconds(chunk.end)}"
-        name = f"chunk-{chunk.index:04d}"
-        event = {"index": chunk.index, "total": len(chunks), "start": chunk.start, "end": chunk.end}
-        saved = checkpoint.load(name)
-        if saved is not None:
-            print(f"  chunk {chunk.index + 1}/{len(chunks)}: {span} (saved, skipped)")
-            results.append(saved["result"])
-            chunk_reports.append({**saved["report"], "resumed": True})
-            progress.emit("chunk", status="resumed", **event)
-            continue
-        print(f"  chunk {chunk.index + 1}/{len(chunks)}: {span}")
-        progress.emit("chunk", status="started", **event)
-        chunk_audio = slice_audio(audio, chunk)
-        attempts = []
-        temperature = args.temperature
-        for retry in range(args.chunk_retries + 1):
-            if retry:
-                temperature = retry_temperatures(retry)
-                print(f"    retrying at temperature {format_temperature(temperature)}")
-            attempt_started_at = time.perf_counter()
-            result = transcribe_audio(
-                chunk_audio,
-                model=args.model,
-                language=language,
-                task=args.task,
-                word_timestamps=args.word_timestamps,
-                temperature=temperature,
-                condition_on_previous_text=args.condition_on_previous_text,
-                verbose=args.verbose_engine,
+    # One bar over the whole file's audio time; chunks are an internal detail. A retry
+    # re-decodes audio the bar has already counted, so it gets a note instead.
+    display = JobProgress(chunks[-1].end, desc="Transcribing", unit="s", clock=True)
+    try:
+        for chunk in chunks:
+            transcribe_chunk(
+                args, chunk, audio, language, checkpoint, progress, display, results, chunk_reports,
+                total=len(chunks),
             )
-            assessment = assess_chunk(result, chunk_audio)
-            attempts.append(
-                {
-                    "attempt": retry,
-                    "temperature": list(temperature)
-                    if isinstance(temperature, tuple)
-                    else temperature,
-                    "elapsed_seconds": time.perf_counter() - attempt_started_at,
-                    **assessment,
-                    "_result": result,
-                }
-            )
-            if not assessment["flags"]:
-                break
-            print(f"    flagged: {', '.join(assessment['flags'])}")
-
-        chosen = min(attempts, key=quality_rank)
-        if len(attempts) > 1:
-            print(f"    kept attempt {chosen['attempt']}")
-        result = offset_result(chosen["_result"], chunk.start)
-        for attempt in attempts:
-            del attempt["_result"]
-        report = {
-            "elapsed_seconds": time.perf_counter() - chunk_started_at,
-            "quality": {
-                "flagged": bool(attempts[0]["flags"]),
-                "flags": chosen["flags"],
-                "chosen_attempt": chosen["attempt"],
-                "attempts": attempts,
-            },
-        }
-        checkpoint.save(name, {"result": result, "report": report})
-        results.append(result)
-        chunk_reports.append({**report, "resumed": False})
-        progress.emit(
-            "chunk",
-            status="done",
-            flags=chosen["flags"],
-            elapsed_seconds=round(report["elapsed_seconds"], 3),
-            **event,
-        )
+            display.advance_to(chunk.end)
+    finally:
+        display.close()
+    resumed = sum(report["resumed"] for report in chunk_reports)
+    if resumed:
+        print(f"Reused {resumed}/{len(chunks)} chunk(s) saved by an earlier run")
 
     merged = merge_chunk_results(results, chunks)
     for summary, report, planned_end in zip(
@@ -1089,6 +1068,104 @@ def run_chunked_engine(
     merged["_elapsed_seconds"] = time.perf_counter() - started_at
     merged["_checkpoint"] = (checkpoint, prune)
     return merged
+
+
+FLAG_DESCRIPTIONS = {
+    "repeated_text": "the same line repeated",
+    "high_compression": "repetitive text",
+    "low_coverage": "too little text for the speech in it",
+    "no_segments": "no text despite speech",
+}
+
+
+def transcribe_chunk(
+    args: argparse.Namespace,
+    chunk: Chunk,
+    audio,
+    language: str | None,
+    checkpoint: Checkpoint,
+    progress: ProgressWriter,
+    display: JobProgress,
+    results: list[dict],
+    chunk_reports: list[dict],
+    *,
+    total: int,
+) -> None:
+    chunk_started_at = time.perf_counter()
+    span = f"{format_seconds(chunk.start)}-{format_seconds(chunk.end)}"
+    name = f"chunk-{chunk.index:04d}"
+    event = {"index": chunk.index, "total": total, "start": chunk.start, "end": chunk.end}
+    saved = checkpoint.load(name)
+    if saved is not None:
+        results.append(saved["result"])
+        chunk_reports.append({**saved["report"], "resumed": True})
+        progress.emit("chunk", status="resumed", **event)
+        return
+    progress.emit("chunk", status="started", **event)
+    chunk_audio = slice_audio(audio, chunk)
+    attempts = []
+    temperature = args.temperature
+    for retry in range(args.chunk_retries + 1):
+        if retry:
+            temperature = retry_temperatures(retry)
+            problems = " and ".join(FLAG_DESCRIPTIONS.get(flag, flag) for flag in attempts[-1]["flags"])
+            display.note(
+                f"Re-transcribing {span} at temperature {format_temperature(temperature)}: "
+                f"the last pass had {problems}"
+            )
+        attempt_started_at = time.perf_counter()
+        with whisper_progress(display if retry == 0 else None):
+            result = transcribe_audio(
+                chunk_audio,
+                model=args.model,
+                language=language,
+                task=args.task,
+                word_timestamps=args.word_timestamps,
+                temperature=temperature,
+                condition_on_previous_text=args.condition_on_previous_text,
+                verbose=args.verbose_engine,
+                skip_silence=args.skip_silence,
+            )
+        assessment = assess_chunk(result, chunk_audio)
+        attempts.append(
+            {
+                "attempt": retry,
+                "temperature": list(temperature)
+                if isinstance(temperature, tuple)
+                else temperature,
+                "elapsed_seconds": time.perf_counter() - attempt_started_at,
+                **assessment,
+                "_result": result,
+            }
+        )
+        if not assessment["flags"]:
+            break
+
+    chosen = min(attempts, key=quality_rank)
+    if len(attempts) > 1 and chosen["attempt"] == 0:
+        display.note(f"Kept the first pass for {span}; the retry was no better")
+    result = offset_result(chosen["_result"], chunk.start)
+    for attempt in attempts:
+        del attempt["_result"]
+    report = {
+        "elapsed_seconds": time.perf_counter() - chunk_started_at,
+        "quality": {
+            "flagged": bool(attempts[0]["flags"]),
+            "flags": chosen["flags"],
+            "chosen_attempt": chosen["attempt"],
+            "attempts": attempts,
+        },
+    }
+    checkpoint.save(name, {"result": result, "report": report})
+    results.append(result)
+    chunk_reports.append({**report, "resumed": False})
+    progress.emit(
+        "chunk",
+        status="done",
+        flags=chosen["flags"],
+        elapsed_seconds=round(report["elapsed_seconds"], 3),
+        **event,
+    )
 
 
 def normalize_language(language: str) -> str | None:

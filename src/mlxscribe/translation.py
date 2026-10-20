@@ -12,6 +12,7 @@ from mlxscribe.exporters.json_exporter import write_json
 from mlxscribe.exporters.srt import write_srt
 from mlxscribe.exporters.txt import write_txt
 from mlxscribe.jobs import Checkpoint, ProgressWriter, content_hash
+from mlxscribe.progress_display import JobProgress
 
 DEFAULT_TRANSLATION_MODEL = "gpt-5.5"
 DEFAULT_MAX_SEGMENTS_PER_BATCH = 40
@@ -119,6 +120,7 @@ def translate_segments_openai(
     retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
     progress: ProgressWriter | None = None,
+    display: JobProgress | None = None,
 ) -> tuple[list[dict], dict]:
     """Translate with the OpenAI Responses API; see ``translate_segments`` for batching."""
     clients = [client]
@@ -148,6 +150,7 @@ def translate_segments_openai(
         retry_delay=retry_delay,
         sleep=sleep,
         progress=progress,
+        display=display,
     )
 
 
@@ -161,6 +164,7 @@ def translate_segments(
     retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
     progress: ProgressWriter | None = None,
+    display: JobProgress | None = None,
 ) -> tuple[list[dict], dict]:
     """Translate in batches, saving each finished batch to ``checkpoint`` as it completes.
 
@@ -181,6 +185,8 @@ def translate_segments(
             merge_usage(usage, saved["usage"])
             usage["resumed_batches"] += 1
             progress.emit("batch", index=index, total=len(batches), status="resumed")
+            if display:
+                display.advance(len(batch))
             continue
 
         progress.emit("batch", index=index, total=len(batches), status="started")
@@ -193,6 +199,7 @@ def translate_segments(
             label=f"batch {index + 1}/{len(batches)}",
             progress=progress,
             index=index,
+            display=display,
         )
         by_id = {item["id"]: item["text"] for item in translations}
         batch_translated = []
@@ -205,6 +212,8 @@ def translate_segments(
         translated.extend(batch_translated)
         merge_usage(usage, batch_usage)
         progress.emit("batch", index=index, total=len(batches), status="done")
+        if display:
+            display.advance(len(batch))
 
     return translated, usage
 
@@ -219,6 +228,7 @@ def request_batch(
     label: str,
     progress: ProgressWriter,
     index: int,
+    display: JobProgress | None = None,
 ) -> tuple[list[dict], dict]:
     for attempt in range(1, max_attempts + 1):
         try:
@@ -230,7 +240,11 @@ def request_batch(
                     "Finished batches are saved; rerun the same command to resume."
                 ) from exc
             delay = retry_delay * 2 ** (attempt - 1)
-            print(f"  {label} attempt {attempt} failed ({exc}); retrying in {delay:g}s", file=sys.stderr)
+            message = f"{label} attempt {attempt} failed ({exc}); retrying in {delay:g}s"
+            if display:
+                display.note(message)
+            else:
+                print(f"  {message}", file=sys.stderr)
             progress.emit("batch", index=index, status="retrying", attempt=attempt, error=str(exc))
             sleep(delay)
     raise AssertionError("unreachable")
