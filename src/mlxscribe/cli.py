@@ -30,6 +30,7 @@ from mlxscribe.exporters.txt import write_txt
 from mlxscribe.filters import FilterOptions, filter_transcript
 from mlxscribe.formats import parse_formats
 from mlxscribe.media import extract_audio, load_wav, probe_duration
+from mlxscribe.subtitles import SubtitleOptions, clean_subtitles
 from mlxscribe.transcripts import clean_segments, load_transcript, transcript_stem
 from mlxscribe.translation import (
     DEFAULT_MAX_SEGMENTS_PER_BATCH,
@@ -211,6 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
             "temperature. Defaults to 1; 0 disables retries."
         ),
     )
+    add_subtitle_arguments(transcribe_parser)
     transcribe_parser.set_defaults(command="transcribe")
 
     filter_parser = subparsers.add_parser(
@@ -235,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="conservative",
         help="Noise filtering mode.",
     )
+    add_subtitle_arguments(filter_parser)
     filter_parser.set_defaults(command="filter")
 
     translate_parser = subparsers.add_parser(
@@ -277,9 +280,107 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_SEGMENTS_PER_BATCH,
         help="Number of subtitle segments to translate per request.",
     )
+    add_subtitle_arguments(translate_parser)
     translate_parser.set_defaults(command="translate")
 
     return parser
+
+
+def add_subtitle_arguments(parser: argparse.ArgumentParser) -> None:
+    defaults = SubtitleOptions()
+    group = parser.add_argument_group(
+        "subtitle cleanup",
+        "Applied to SRT and TXT output only; JSON keeps the raw segments.",
+    )
+    group.add_argument(
+        "--no-subtitle-cleanup",
+        dest="subtitle_cleanup",
+        action="store_false",
+        help="Write each segment as one cue, unwrapped, as before cleanup existed.",
+    )
+    group.add_argument(
+        "--max-lines",
+        type=positive_int,
+        default=defaults.max_lines,
+        help=f"Maximum lines per subtitle. Defaults to {defaults.max_lines}.",
+    )
+    group.add_argument(
+        "--max-line-chars",
+        type=positive_int,
+        default=defaults.max_line_chars,
+        help=(
+            "Maximum characters per line for Latin-script text. "
+            f"Defaults to {defaults.max_line_chars}."
+        ),
+    )
+    group.add_argument(
+        "--max-line-chars-cjk",
+        type=positive_int,
+        default=defaults.max_line_chars_cjk,
+        help=(
+            "Maximum characters per line for Chinese, Japanese, or Korean text. "
+            f"Defaults to {defaults.max_line_chars_cjk}."
+        ),
+    )
+    group.add_argument(
+        "--min-cue-seconds",
+        type=non_negative_float,
+        default=defaults.min_duration_seconds,
+        help=(
+            "Minimum time a subtitle stays on screen, never overlapping the next one. "
+            f"Defaults to {defaults.min_duration_seconds:g}."
+        ),
+    )
+    group.add_argument(
+        "--max-cue-seconds",
+        type=positive_float,
+        default=defaults.max_duration_seconds,
+        help=(
+            "Split subtitles longer than this into timed pieces. "
+            f"Defaults to {defaults.max_duration_seconds:g}."
+        ),
+    )
+    group.add_argument(
+        "--merge-gap-seconds",
+        type=non_negative_float,
+        default=defaults.merge_gap_seconds,
+        help=(
+            "Merge a short subtitle into its neighbour when the gap between them is at "
+            f"most this long and the result still fits. Defaults to {defaults.merge_gap_seconds:g}."
+        ),
+    )
+
+
+def subtitle_options_from_args(args: argparse.Namespace) -> SubtitleOptions:
+    return SubtitleOptions(
+        enabled=args.subtitle_cleanup,
+        max_lines=args.max_lines,
+        max_line_chars=args.max_line_chars,
+        max_line_chars_cjk=args.max_line_chars_cjk,
+        min_duration_seconds=args.min_cue_seconds,
+        max_duration_seconds=args.max_cue_seconds,
+        merge_gap_seconds=args.merge_gap_seconds,
+    )
+
+
+def print_subtitle_summary(summary: dict) -> None:
+    if not summary.get("enabled"):
+        return
+    print(
+        "Subtitles: "
+        f"{summary['input_segments']} segment(s) -> {summary['output_cues']} cue(s); "
+        f"split {summary['split_segments']}, merged {summary['merged_segments']}, "
+        f"extended {summary['extended_cues']}, wrapped {summary['wrapped_cues']}"
+    )
+    remaining = {
+        "long lines": summary["remaining_long_lines"],
+        "short cues": summary["remaining_short_cues"],
+        "cues over max duration": summary["remaining_long_cues"],
+        "overlaps": summary["remaining_overlaps"],
+    }
+    left = [f"{count} {label}" for label, count in remaining.items() if count]
+    if left:
+        print(f"Subtitles left as is: {', '.join(left)}")
 
 
 def positive_float(value: str) -> float:
@@ -307,6 +408,23 @@ def parse_chunk_minutes(value: str) -> str | float:
     if normalized in (CHUNK_AUTO, CHUNK_OFF):
         return normalized
     return positive_float(value)
+
+
+def non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or greater, got {value}")
+    return number
+
+
+def positive_int(value: str) -> int:
+    number = non_negative_int(value)
+    if number == 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {value}")
+    return number
 
 
 def non_negative_int(value: str) -> int:
@@ -431,8 +549,12 @@ def run_transcribe(args: argparse.Namespace) -> int:
 
     output_language = result.get("language") or args.language
     phase_started_at = time.perf_counter()
+    subtitles, subtitle_summary = prepare_subtitles(
+        result, subtitle_options_from_args(args), formats
+    )
     write_outputs(
         result=result,
+        subtitles=subtitles,
         output_dir=output_dir,
         stem=stem,
         language=output_language,
@@ -482,6 +604,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
             "dropped": [],
             "rules": [],
         },
+        "subtitles": subtitle_summary,
     }
     benchmark_path = output_dir / f"{stem}.benchmark.json"
     benchmark_path.write_text(json.dumps(benchmark, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -504,6 +627,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
             f"dropped {filter_summary['dropped_segments']} segment(s), "
             f"kept {filter_summary['kept_segments']}"
         )
+    print_subtitle_summary(subtitle_summary)
     return 0
 
 
@@ -579,8 +703,13 @@ def run_translate(args: argparse.Namespace) -> int:
         token_estimate=estimate,
         usage=usage,
     )
+    subtitles, subtitle_summary = prepare_subtitles(
+        result, subtitle_options_from_args(args), ("srt", "txt")
+    )
+    result["subtitles"] = subtitle_summary
     paths = write_translation_outputs(
         result=result,
+        subtitles=subtitles,
         output_dir=output_dir,
         stem=stem,
         target_language=args.target_language,
@@ -593,6 +722,7 @@ def run_translate(args: argparse.Namespace) -> int:
     print(f"Wrote JSON: {paths['json']}")
     print(f"Wrote SRT: {paths['srt']}")
     print(f"Wrote TXT: {paths['txt']}")
+    print_subtitle_summary(subtitle_summary)
     return 0
 
 
@@ -609,8 +739,13 @@ def run_filter(args: argparse.Namespace) -> int:
         source,
         FilterOptions(enabled=True, mode=args.filter_mode),
     )
+    subtitles, subtitle_summary = prepare_subtitles(
+        filtered, subtitle_options_from_args(args), formats
+    )
+    filtered["subtitles"] = subtitle_summary
     write_outputs(
         result=filtered,
+        subtitles=subtitles,
         output_dir=output_dir,
         stem=stem,
         language=source_language,
@@ -626,6 +761,7 @@ def run_filter(args: argparse.Namespace) -> int:
     )
     if summary["rules"]:
         print(f"Rules: {', '.join(summary['rules'])}")
+    print_subtitle_summary(subtitle_summary)
     return 0
 
 
@@ -833,6 +969,17 @@ def get_hf_home() -> Path:
     return Path(os.environ.get("HF_HOME", DEFAULT_HF_HOME)).expanduser().resolve()
 
 
+def prepare_subtitles(
+    result: dict,
+    options: SubtitleOptions,
+    formats: tuple[str, ...],
+) -> tuple[dict, dict]:
+    """Clean segments for SRT and TXT; JSON output keeps ``result`` untouched."""
+    if not {"srt", "txt"} & set(formats):
+        return result, {"enabled": False, "reason": "no srt or txt output"}
+    return clean_subtitles(result, options)
+
+
 def write_outputs(
     *,
     result: dict,
@@ -840,14 +987,16 @@ def write_outputs(
     stem: str,
     language: str,
     formats: tuple[str, ...],
+    subtitles: dict | None = None,
 ) -> None:
     base = output_dir / f"{stem}.{language}"
+    subtitles = subtitles or result
     if "json" in formats:
         write_json(base.with_suffix(".json"), result)
     if "txt" in formats:
-        write_txt(base.with_suffix(".txt"), result)
+        write_txt(base.with_suffix(".txt"), subtitles)
     if "srt" in formats:
-        write_srt(base.with_suffix(".srt"), result)
+        write_srt(base.with_suffix(".srt"), subtitles)
 
 
 if __name__ == "__main__":

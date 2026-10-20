@@ -182,6 +182,7 @@ def write_translation_outputs(
     output_dir: Path,
     stem: str,
     target_language: str,
+    subtitles: dict | None = None,
 ) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     base = output_dir / f"{stem}.{target_language}"
@@ -191,6 +192,7 @@ def write_translation_outputs(
         "txt": str(base.with_suffix(".txt")),
     }
     write_json(Path(paths["json"]), result)
-    write_srt(Path(paths["srt"]), result)
-    write_txt(Path(paths["txt"]), result)
+    subtitles = subtitles or result
+    write_srt(Path(paths["srt"]), subtitles)
+    write_txt(Path(paths["txt"]), subtitles)
     return paths

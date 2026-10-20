@@ -9,7 +9,8 @@ def write_srt(path: Path, result: dict) -> None:
     for index, segment in enumerate(segments, start=1):
         start = format_srt_timestamp(float(segment.get("start", 0)))
         end = format_srt_timestamp(float(segment.get("end", 0)))
-        text = str(segment.get("text", "")).strip()
+        lines = segment.get("lines")
+        text = "\n".join(lines) if lines else str(segment.get("text", "")).strip()
         blocks.append(f"{index}\n{start} --> {end}\n{text}")
 
     path.write_text("\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8")
